@@ -161,6 +161,63 @@ lock asset/price × calls                               │
                                                   snapshot/re-lock new terms
 ```
 
+## Sequence
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Payer
+    participant Chain as On-chain Program
+    actor Agent as AI Agent
+    participant Broker as Spend Broker
+    participant Provider as Service / Gateway
+
+    Payer->>Chain: Open channel
+    Chain->>Chain: Validate service, nonce, and quota
+    Chain->>Chain: Create epoch 1 + isolated escrow
+    Chain-->>Payer: ChannelCreated(snapshot, expiration)
+    Payer->>Broker: Install capability + epoch voucher tranche
+
+    loop Each metered call
+        Agent->>Broker: execute(channel, idempotency_key, request)
+        Broker->>Broker: Policy checks; choose counter n
+        Broker->>Provider: request + voucher(epoch, version, n)
+        Provider->>Provider: Require Open and n = last_accepted + 1
+        Provider->>Provider: Execute once; persist result + receipt
+        Provider-->>Broker: result + receipt(request_hash, result_hash)
+        Broker->>Broker: Verify receipt; persist ack + result
+        Broker-->>Agent: Verified result
+    end
+
+    opt Batched settlement
+        Provider->>Chain: claim_channel_funds(highest voucher)
+        Chain->>Chain: Verify snapshot + bounded counter
+        Chain-->>Provider: Transfer channel.price × delta
+    end
+
+    Payer->>Chain: request_channel_transition(Close or Rollover)
+    opt Rollover
+        Chain->>Chain: Snapshot + pre-fund pending next epoch
+    end
+    Chain-->>Broker: ChannelTransitionRequested / Closing
+    Broker->>Broker: Freeze new calls
+
+    rect rgb(245, 245, 245)
+        Note over Chain,Provider: Challenge window
+        Provider->>Chain: Claim latest old-epoch voucher
+        Chain-->>Provider: Settle before close_after
+    end
+
+    Payer->>Chain: finalize_channel_transition()
+    alt Close
+        Chain-->>Payer: Refund remaining; delete channel
+    else Rollover
+        Chain-->>Payer: Refund old remainder
+        Chain->>Chain: Promote pending escrow; epoch++; counter = 0
+        Chain-->>Broker: ChannelRolledOver(new snapshot)
+    end
+```
+
 ### 1. Open
 
 Payer supplies the current `NextChannelNonce[payer]` and call quota `N`.
