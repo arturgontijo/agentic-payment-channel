@@ -170,36 +170,36 @@ sequenceDiagram
     participant Chain as On-chain Program
     actor Agent as AI Agent
     participant Broker as Spend Broker
-    participant Provider as Service / Gateway
+    participant Provider as Service Gateway
 
     Payer->>Chain: Open channel
     Chain->>Chain: Validate service, nonce, and quota
-    Chain->>Chain: Create epoch 1 + isolated escrow
-    Chain-->>Payer: ChannelCreated(snapshot, expiration)
-    Payer->>Broker: Install capability + epoch voucher tranche
+    Chain->>Chain: Create epoch 1 and isolated escrow
+    Chain-->>Payer: ChannelCreated
+    Payer->>Broker: Install capability and epoch voucher tranche
 
     loop Each metered call
-        Agent->>Broker: execute(channel, idempotency_key, request)
-        Broker->>Broker: Policy checks; choose counter n
-        Broker->>Provider: request + voucher(epoch, version, n)
-        Provider->>Provider: Require Open and n = last_accepted + 1
-        Provider->>Provider: Execute once; persist result + receipt
-        Provider-->>Broker: result + receipt(request_hash, result_hash)
-        Broker->>Broker: Verify receipt; persist ack + result
+        Agent->>Broker: execute request
+        Broker->>Broker: Policy checks, choose counter n
+        Broker->>Provider: request plus voucher n
+        Provider->>Provider: Require Open and sequential n
+        Provider->>Provider: Execute once, persist result and receipt
+        Provider-->>Broker: result and receipt
+        Broker->>Broker: Verify receipt, persist ack and result
         Broker-->>Agent: Verified result
     end
 
     opt Batched settlement
-        Provider->>Chain: claim_channel_funds(highest voucher)
-        Chain->>Chain: Verify snapshot + bounded counter
-        Chain-->>Provider: Transfer channel.price × delta
+        Provider->>Chain: claim highest voucher
+        Chain->>Chain: Verify snapshot and bounded counter
+        Chain-->>Provider: Transfer price times delta
     end
 
-    Payer->>Chain: request_channel_transition(Close or Rollover)
+    Payer->>Chain: request Close or Rollover
     opt Rollover
-        Chain->>Chain: Snapshot + pre-fund pending next epoch
+        Chain->>Chain: Snapshot and pre-fund pending next epoch
     end
-    Chain-->>Broker: ChannelTransitionRequested / Closing
+    Chain-->>Broker: ChannelTransitionRequested
     Broker->>Broker: Freeze new calls
 
     rect rgb(245, 245, 245)
@@ -208,13 +208,13 @@ sequenceDiagram
         Chain-->>Provider: Settle before close_after
     end
 
-    Payer->>Chain: finalize_channel_transition()
+    Payer->>Chain: finalize_channel_transition
     alt Close
-        Chain-->>Payer: Refund remaining; delete channel
+        Chain-->>Payer: Refund remaining and delete channel
     else Rollover
         Chain-->>Payer: Refund old remainder
-        Chain->>Chain: Promote pending escrow; epoch++; counter = 0
-        Chain-->>Broker: ChannelRolledOver(new snapshot)
+        Chain->>Chain: Promote pending escrow, increment epoch, reset counter
+        Chain-->>Broker: ChannelRolledOver
     end
 ```
 
