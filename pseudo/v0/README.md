@@ -2,9 +2,9 @@
 
 Metered APIs and AI agents need to pay **per call** without a chain transaction per request, and without handing the agent a funded wallet.
 
-This spec is a **prepaid unidirectional payment channel**: a human locks `price × calls` against a priced service; the payer (or a vault on their behalf) signs cumulative vouchers off-chain; the provider settles in one on-chain claim. Open channels snapshot price and version so a later service update cannot silently re-rate old IOUs.
+This spec is a **prepaid unidirectional payment channel**: a human locks `price × calls` against a priced service; the payer (or a vault on their behalf) signs cumulative vouchers off-chain; the provider settles in one on-chain claim. Channel epochs snapshot asset, price, version, and receipt key so later service changes cannot silently re-rate old IOUs.
 
-Agents never hold spend keys. A human-managed vault dispenses the **next** voucher only, and only after the service returns `{ result, receipt }` for the previous call. The on-chain lock is the hard cap; vault policy is the fine-grained budget.
+Agents never hold spend keys **or bearer vouchers**. A human-managed spend broker attaches the next voucher, accepts only `{ result, receipt }`, and returns the result after receipt verification. The on-chain lock is the hard cap; broker/vault policy is the fine-grained budget.
 
 This directory is the chain-agnostic v0 program + off-chain protocol. Translate each file into the target language (e.g. Anchor/Rust). Do not invent extra instructions. How to slice the work for review: [ROADMAP.md](ROADMAP.md). Background: [RESEARCH.md](../../research/RESEARCH.md), [AGENTIC.md](../../research/AGENTIC.md).
 
@@ -13,10 +13,10 @@ Time unit (`now()`), token mint, and account addresses are target-defined. Proto
 ```
 Organization
   └── Service          priced, versioned
-        └── Channel    one per (payer, org, service); prepaid quota
+        └── Channel    nonce-isolated (usually one per agent); prepaid quota
 ```
 
-Funds live in a single program-owned `VAULT`. Opens/updates transfer in; claims/refunds/closes transfer out.
+Funds live in an isolated program-owned escrow per channel/asset. Claims transfer out; close/rollover refunds only after an on-chain challenge window.
 
 ---
 
@@ -28,9 +28,9 @@ Funds live in a single program-owned `VAULT`. Opens/updates transfer in; claims/
 | [`02-ids.md`](02-ids.md) | `ids` / crypto helpers | domain, id hashes, voucher + **receipt** digests, sig verify |
 | [`03-organization.md`](03-organization.md) | org instructions | create / delete + members |
 | [`04-service.md`](04-service.md) | service instructions | create / update / delete (`version++`) |
-| [`05-channel.md`](05-channel.md) | channel instructions | `remaining()`, open, update |
-| [`06-claim.md`](06-claim.md) | claim instruction | empty / payer refund / voucher settle |
-| [`07-offchain.md`](07-offchain.md) | client / provider / vault (not the program) | sequential consume, **receipts**, watchers |
+| [`05-channel.md`](05-channel.md) | channel instructions | open, request/cancel/finalize transition |
+| [`06-claim.md`](06-claim.md) | claim instruction | exhausted cleanup / voucher settle |
+| [`07-offchain.md`](07-offchain.md) | spend broker / provider (not the program) | sequential consume, receipts, retries, watchers |
 
 Helpers are defined once (`02`, `remaining` in `05`) and referenced, never copied.
 
@@ -46,31 +46,35 @@ Helpers are defined once (`02`, `remaining` in `05`) and referenced, never copie
 | `update_service` | service owner | 04 |
 | `delete_service` | service owner | 04 |
 | `open_channel` | payer | 05 |
-| `update_channel` | payer | 05 |
+| `request_channel_transition` | payer | 05 |
+| `cancel_channel_transition` | payer | 05 |
+| `finalize_channel_transition` | anyone | 05 |
 | `claim_channel_funds` | anyone | 06 |
 
-Deletes are **rejected** while children exist (`services == 0` / `channels == 0`). Close channels via `claim_channel_funds` first.
+Deletes are rejected while children exist. Close channels via a challenged transition first.
 
 ---
 
 ## Invariants
 
-1. One channel per `(payer, organization, service)`. Id is `hash_channel_id` (see 02).
-2. Escrow for a channel equals `price × (calls − counter)` until claim, refund, or update.
-3. On-chain `counter` only increases, and only with a payer signature (path C).
+1. Channel id is `(domain, payer, organization, service, nonce)`; `NextChannelNonce[payer]` only increases.
+2. Each channel/asset escrow equals `price × (calls − counter)` for the active epoch.
+3. `0 ≤ counter ≤ calls`; counter only increases with a valid payer voucher.
 4. Claims use `channel.price`, never live `service.price`.
-5. Voucher version must equal **`channel.version`** (snapshot), not live `service.version`.
-6. Payer refund only after expiry **or** version mismatch.
+5. Vouchers bind to channel `epoch` + `version` and the deployment domain.
+6. Refund/rollover only after `CLOSE_CHALLENGE_PERIOD`; rollover is pre-funded at request and old-epoch claims stay valid until finalization.
 7. Claim payout to `service.owner`, independent of tx sender.
 8. `update_service` always increments `version`.
 9. `delete_service` iff `channels == 0`; `delete_organization` iff `services == 0`.
+10. Asset is explicit/immutable per service; all arithmetic is checked and all state/transfers are atomic.
+11. Rollover is the only counter reset; it increments epoch.
 
-v0 vs the original source: vouchers bind to `channel.version` (a bump does not burn IOUs); deletes refuse children; `update_channel` **persists** and **resets `counter` to 0**; `MAX_ORG_MEMBERS` is enforced; `trials` is stored, not billed.
+v0 vs the original source: deployment-scoped canonical digests; nonce-isolated channels; epoch-bound vouchers; per-channel escrow; challenged close/rollover; checked arithmetic and strict counter bounds; result-bound receipts; spend broker; deletes refuse children; member cap enforced; `trials` stored but not billed.
 
 ---
 
 ## Out of v0 (target port)
 
-PDA seeds, mint (SOL vs SPL), `Clock` slot vs unix time, event encoding. Pick them at translation time; do not change the instruction set or the voucher layout.
+Account/PDA mechanics, concrete signature scheme, time source, and event encoding are adapter choices. They must not change instruction semantics or canonical digest bytes.
 
-v1 ideas (members, cooperative close, `fund_channel`, channel seed, `trials` billing, challenge period) live in `research/RESEARCH.md` — do not invent them in this port.
+v1 ideas (member lifecycle, `fund_channel`, `trials` billing, optional disputes/TEEs/verifiable services) live in `research/RESEARCH.md` — do not invent them in this port.

@@ -1,69 +1,58 @@
-# Claim / close
+# Voucher claim / exhausted cleanup
 
 Requires: [`01-types.md`](01-types.md), [`02-ids.md`](02-ids.md), `remaining()` from [`05-channel.md`](05-channel.md).
 
-Anyone may call. Voucher payout always goes to `service.owner`, not the tx sender.
+Anyone may call. Voucher payout always goes to `service.owner`, never the submitter.
 
-Until expiry **and** while `channel.version == service.version`, the payer cannot unilaterally withdraw. That is the provider’s claim window.
-
-After expiry **or** a version bump, path C still works (vouchers bind to `channel.version`). Path B also unlocks: the payer may take `remaining` (on-chain `counter`, not an unclaimed voucher). First successful tx wins. Claim before expiry and before `update_service`.
+Claims remain valid while a channel is `Open` **or** `Closing`, including after service version changes and expiry. A payer never receives an immediate refund: close/rollover uses the challenge state machine in [`05-channel.md`](05-channel.md).
 
 ---
 
 ## `claim_channel_funds(payer, channel_id, counter?, signature?)`
 
-`counter` defaults to `0`. `signature` is required only on path C.
+`counter` defaults to `0`. `signature` is required only for voucher settlement.
 
 ```
 ch  = Channels[(payer, channel_id)]             else ChannelNotFound
 svc = Services[(ch.organization, ch.service)]   else ServiceNotFound
 
-left           = remaining(ch)
-expired        = ch.expiration <= now()
-version_changed = ch.version != svc.version
-n              = counter ?? 0
+left = remaining(ch)
+n    = counter ?? 0
 
-// ---- Path A: nothing left to claim ------------------------------------------
+// ---- Path A: exhausted cleanup ----------------------------------------------
 if left == 0:
-  svc.channels -= 1
+  // Preserve a requested rollover: finalization will fund the next epoch.
+  if ch.status is Closing { action: Rollover }:
+    return
+
+  svc.channels = checked_sub(svc.channels, 1)
   Services[(ch.organization, ch.service)] = svc
+  close ESCROW(channel_id)
   delete Channels[(payer, channel_id)]
   emit ChannelDeleted { id: channel_id, by: caller, funds: 0 }
   return
 
-// ---- Path B: payer refund (expiry or version mismatch) ----------------------
-if caller == ch.owner:
-  if expired or version_changed:
-    transfer(VAULT → ch.owner, left)
-    svc.channels -= 1
-    Services[(ch.organization, ch.service)] = svc
-    delete Channels[(payer, channel_id)]
-    emit ChannelExpiredClaimed { id: channel_id, by: caller, funds: left }
-    return
-  else if n == 0:
-    fail ClaimNotExpired
-  // else fall through to path C (payer may settle a voucher on the provider's behalf)
-
-// ---- Path C: voucher settlement ---------------------------------------------
+// ---- Path B: voucher settlement ---------------------------------------------
 require n > ch.counter                          else ClaimLowCounter
+require n <= ch.calls                           else ClaimCounterTooHigh
 sig = signature                                 else ClaimInvalidSignature
-verify_voucher(ch.owner, channel_id, ch.version, n, sig)
-  // channel snapshot, not live svc.version
+verify_voucher(ch.owner, channel_id, ch.epoch, ch.version, n, sig)
+  // channel epoch/version snapshots, never live svc.version
 
-claim = ch.price × (n − ch.counter)             // snapshotted price
-max   = ch.price × ch.calls
-if claim > max: claim = max
+delta = checked_sub(n, ch.counter)
+claim = checked_mul(ch.price, delta)            // snapshotted price
 require claim <= left                           else ClaimNotEnoughFunds
 
-transfer(VAULT → svc.owner, claim)
+transfer(ch.asset, ESCROW(channel_id) → svc.owner, claim)
 
 ch.counter = n
 Channels[(payer, channel_id)] = ch
-Services[(ch.organization, ch.service)] = svc   // unchanged counts; persist if target requires it
 
-emit ChannelClaimed { id: channel_id, by: caller, counter: n, funds: claim }
+emit ChannelClaimed {
+  id: channel_id, epoch: ch.epoch, by: caller, counter: n, funds: claim
+}
 ```
 
-Channel stays open after path C if `remaining(ch) > 0`. Provider can claim incrementally (keep the highest voucher, cash out any time before expiry).
+Channel stays present after voucher settlement, even if `counter == calls`; a later call with no voucher performs exhausted cleanup. For `Closing/Rollover`, exhausted state remains until transition finalization.
 
-A signed `n > calls` cannot overdraw: `claim` is capped and then checked against `left`.
+There is no cap-and-continue behavior: `n > calls`, overflow, asset mismatch, or insufficient escrow aborts. State and balances update atomically.

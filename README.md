@@ -2,16 +2,16 @@
 
 Prepaid, unidirectional **call channels** so metered APIs and AI agents can pay per request without a blockchain transaction each time — and without giving the agent a funded wallet.
 
-A human (or a vault they control) locks `price × calls` against a priced service. Off-chain, the payer signs cumulative vouchers as calls happen. The provider settles many calls in one on-chain claim. Channels snapshot price and version so a later service update cannot silently re-rate old IOUs.
+A human locks `price × calls` of an explicit asset in a nonce-isolated channel. Off-chain, a spend broker uses cumulative, epoch-bound vouchers. The provider settles many calls in one claim. Challenged close/rollover gives the provider time to settle before any refund.
 
-Agents never hold spend keys. A human-managed vault only releases the **next** voucher, and only after the service returns `{ result, receipt }` in the same response. The on-chain lock is the hard cap; vault policy is the budget.
+Agents never hold spend keys or bearer vouchers. A human-managed spend broker attaches the next voucher, verifies a provider receipt bound to request/result hashes, persists it, then returns the result. The on-chain escrow is the hard cap; broker policy is the budget.
 
 The protocol is **chain-agnostic**. Port it by translating `pseudo/v0` (Solana/Anchor, or any other runtime). Do not add v1 features in the first port.
 
 ```
 Organization
   └── Service          priced, versioned
-        └── Channel    one per (payer, org, service); prepaid quota
+        └── Channel    nonce-isolated, epoch-based prepaid quota
 ```
 
 ## Start here
