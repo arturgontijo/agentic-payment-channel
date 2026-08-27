@@ -2,7 +2,7 @@
 
 How to turn this spec into a working port on **any** chain, in small reviewable slices.
 
-Source of truth: the files in this directory + [research/RESEARCH.md](../../research/RESEARCH.md) + [research/AGENTIC.md](../../research/AGENTIC.md). **Translate, do not redesign.** Nonce-isolated channels, version-bound vouchers, monotonic counters, `fund_channel`, challenged close/AdoptTerms, explicit assets, spend broker, and result-bound receipts are v0.
+Source of truth: the files in this directory + [research/RESEARCH.md](../../research/RESEARCH.md) + [research/AGENTIC.md](../../research/AGENTIC.md). **Translate, do not redesign.** A runnable story with the tool list is [research/EXAMPLE.md](../../research/EXAMPLE.md). Nonce-isolated channels, version-bound vouchers, monotonic counters, metered/subscription billing, `fund_channel`, challenged close/AdoptTerms, admission pause, explicit assets, spend broker, and result-bound receipts are v0.
 
 ---
 
@@ -115,7 +115,7 @@ C and D can start after B0; they integrate with A on a devnet in E.
 | # | Task | Spec | Tests | Review focus |
 |---|---|---|---|---|
 | E0 | Thin client: agent calls broker `execute`; broker returns verified result | [07-offchain.md](07-offchain.md) | No voucher/signature in agent process/logs | No keys/bearer IOUs |
-| E1 | Happy demo: human opens small channel, loads tranche, agent makes N calls, provider claims | All | Balances: locked / dispensed / acked / settled | Four numbers in AGENTIC |
+| E1 | Happy demo: human opens small channel, loads tranche, agent makes N calls, provider claims | [EXAMPLE.md](../../research/EXAMPLE.md) | Balances: locked / dispensed / acked / settled | Four numbers in AGENTIC |
 | E2 | Version bump: broker freezes; challenged AdoptTerms; new ladder from `counter+1` | RESEARCH versioning | Old claim lands before deadline; new version rejects old voucher; counter continues | |
 | E3 | Same-term `fund_channel`: extra rungs, no freeze | 05 + AGENTIC | `counter` unchanged; next `n` continues | |
 

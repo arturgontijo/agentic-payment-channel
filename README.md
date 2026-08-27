@@ -20,5 +20,6 @@ Organization
 |---|---|
 | [research/RESEARCH.md](research/RESEARCH.md) | On-chain model, claims, versioning, invariants |
 | [research/AGENTIC.md](research/AGENTIC.md) | Agents, KMS/vault, pre-signed ladder, receipts |
+| [research/EXAMPLE.md](research/EXAMPLE.md) | End-to-end use case and tools to build (provider, payer, agents) |
 | [pseudo/v0/README.md](pseudo/v0/README.md) | v0 spec to implement (types, instructions, off-chain) |
 | [pseudo/v0/ROADMAP.md](pseudo/v0/ROADMAP.md) | Small PRs, adapter-per-chain, review-friendly order |
