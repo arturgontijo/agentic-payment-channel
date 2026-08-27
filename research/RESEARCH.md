@@ -51,9 +51,10 @@ A named provider entity.
 | `name` | Unique per owner |
 | `members` | Count of member accounts |
 | `services` | Count of published services |
+| `paused` | Admission hold: no new services/channels/`AdoptTerms` under the org |
 | `metadata` | Arbitrary blob (endpoint, docs, branding) |
 
-Creating an organization **reserves a deposit** from the owner (anti-spam). The deposit is returned on delete. Members are stored as `(organization_id, account) → rank`. Rank `0` is the owner; other members start at rank `1`. Only members may create services under the org.
+Creating an organization **reserves a deposit** from the owner (anti-spam). The deposit is returned on delete. Members are stored as `(organization_id, account) → rank`. Rank `0` is the owner; other members start at rank `1`. Only members may create services under the org. The owner may `set_organization_paused` to stop new admission while existing channels drain; delete still requires `services == 0`.
 
 IDs are content-addressed. Two owners can reuse the same display name; collisions under one owner are rejected.
 
@@ -65,6 +66,7 @@ A priced, versioned offering.
 |---|---|
 | `id` | Deterministic hash of `(domain, owner, name)` |
 | `owner` | Account that receives claims |
+| `org_owner` | Parent organization owner (lookup key) |
 | `receipt_signer` | Provider/gateway key whose delivery receipts the spend broker accepts |
 | `organization` | Parent org id |
 | `name` | Unique per organization |
@@ -75,9 +77,10 @@ A priced, versioned offering.
 | `expiration_threshold` | Channel lifetime, in chain time units (blocks / slots) |
 | `trials` | Reserved for a free-trial quota (not enforced in the current logic) |
 | `channels` | Count of open channels against this service |
+| `paused` | Admission hold: no new channels / `AdoptTerms` for this service |
 | `metadata` | Arbitrary blob (schema, model id, rate-limit hints) |
 
-Updating a service **always bumps `version`**. Open channels keep their snapshot; new terms apply only after a challenged AdoptTerms (see [Service versioning](#service-versioning)). Same-term extra quota is `fund_channel`.
+Updating a service **always bumps `version`**. Open channels keep their snapshot; new terms apply only after a challenged AdoptTerms (see [Service versioning](#service-versioning)). Same-term extra quota is `fund_channel`. `set_service_paused` (or a parent org pause) stops new channels and AdoptTerms without bumping `version`.
 
 ### Channel
 
@@ -230,7 +233,7 @@ Payer supplies the current `NextChannelNonce[payer]` and call quota `N`.
 
 Checks:
 
-- Service exists.
+- Service exists and neither the service nor its organization is paused.
 - `N ≥ service.minimum_calls`.
 - `nonce == NextChannelNonce[payer]`; successful open increments it, so ids cannot repeat.
 
@@ -298,16 +301,23 @@ Immediate **refunds** and **re-prices** are unsafe because an unclaimed voucher 
    - **Close:** refund latest `remaining` and delete channel; monotonic nonce prevents reopening that id.
    - **AdoptTerms:** refund old remaining, promote pre-funded pending escrow, snapshot new terms, set `calls = counter + pending.calls`, **keep `counter`**, return to `Open`.
 
-Payer may cancel before finalization and recover pending funds. If pre-funding fails, the request rolls back and channel stays `Open`. The channel id stays stable. Old-version vouchers no longer verify after AdoptTerms; new rungs continue from `counter + 1`.
+Payer may cancel before finalization and recover pending funds. If pre-funding fails, the request rolls back and channel stays `Open`. The channel id stays stable. Old-version vouchers no longer verify after AdoptTerms; new rungs continue from `counter + 1`. `AdoptTerms` is rejected while the org or service is paused; `Close` is not.
 
-### 5. Delete organization / service
-
-Owner-only. Unreserves the creation deposit. Organization delete also wipes members.
+### 5. Pause, then delete
 
 Deletes are **rejected** while children exist, so escrow cannot be frozen against a missing service:
 
 - `delete_service` requires `service.channels == 0`.
 - `delete_organization` requires `organization.services == 0` (hence all channels already gone).
+
+**Pause** is the wind-down switch. It does not seize escrow or bump `version`.
+
+| Hold | Who | Blocks | Still allowed |
+|---|---|---|---|
+| `set_service_paused(true)` | Service owner | `open_channel`, `AdoptTerms` | Existing Open calls, `fund_channel`, claims, Close |
+| `set_organization_paused(true)` | Org owner | `create_service`, plus the above for every service | Same as above, org-wide |
+
+To shut down an organization: pause it, let payers exhaust or Close channels, delete empty services, then `delete_organization`. Unpause with `paused = false`.
 
 Close every channel via claim/refund first, then delete service, then delete org.
 
@@ -388,6 +398,7 @@ A port to Solana (or any other chain) should preserve these, regardless of accou
 10. **Explicit asset.** Service asset is immutable; channel/escrow snapshot it.
 11. **Atomic checked state.** Overflow, underflow, transfer failure, wrong asset, or invalid signature changes nothing.
 12. **Monotonic quota.** `fund_channel` raises `calls` at the current snapshot. Finalized AdoptTerms sets `calls = counter + new_quota` and keeps `counter`.
+13. **Admission pause.** Org or service `paused` blocks `create_service`, `open_channel`, and `AdoptTerms` only. It does not bump `version` or move funds.
 
 ---
 
@@ -425,7 +436,8 @@ sign(H(domain || "voucher" || channel_id
 - **Use checked arithmetic and atomic state/transfers.** Never saturate.
 - **Never reuse a channel nonce/id.** Protocol-assigned `NextChannelNonce[payer]` only increases.
 - **Use challenged close / AdoptTerms.** Immediate refunds or in-place re-prices can steal from an unclaimed voucher.
-- **Refuse delete while children exist.** Otherwise claim/refund cannot load `service.owner` and funds freeze.
+- **Refuse delete while children exist.** Otherwise claim/refund cannot load `service.owner` and funds freeze. Pause first to stop new admission.
+- **Pause is admission-only.** It does not bump `version`, seize escrow, or cancel prepaid calls.
 - **Keep asset explicit and immutable** for each service.
 - **Anyone-can-submit claims** is intentional (relayer-friendly) only if payout is hardcoded to `service.owner`.
 - **One canonical raw-digest signature convention.** Do not accept alternate wrapping.
@@ -439,9 +451,11 @@ A complete port needs roughly these instructions:
 | Instruction | Caller | Purpose |
 |---|---|---|
 | `create_organization` | future owner | Register org, lock deposit, add members |
+| `set_organization_paused` | owner | Block new services/channels/AdoptTerms under the org |
 | `delete_organization` | owner | Remove org, return deposit (requires `services == 0`) |
 | `create_service` | org member | Publish priced service, lock deposit |
 | `update_service` | service owner | Edit terms, bump version (does not rewrite channels) |
+| `set_service_paused` | service owner | Block new channels / AdoptTerms for this service |
 | `delete_service` | service owner | Remove service, return deposit (requires `channels == 0`) |
 | `open_channel` | payer | Lock asset/price × calls under next payer nonce |
 | `fund_channel` | payer | Same-term top-up: raise `calls`, keep `counter` |

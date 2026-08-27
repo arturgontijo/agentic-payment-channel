@@ -279,6 +279,7 @@ Maps onto [RESEARCH.md](RESEARCH.md) instructions.
 | Action | Signer | Why |
 |---|---|---|
 | `create/delete` org/service | Provider, not this flow | — |
+| `set_organization_paused` / `set_service_paused` | Provider org/service owner | Stop new admission; not a payer/agent action |
 | `open_channel` | Human via vault | Locks money |
 | `fund_channel` | Human via vault | Same-term top-up |
 | `request/cancel` channel transition | Human via vault | Starts/stops challenged close / AdoptTerms |

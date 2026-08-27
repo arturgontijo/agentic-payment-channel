@@ -26,8 +26,8 @@ Funds live in an isolated program-owned escrow per channel/asset. Claims transfe
 |---|---|---|
 | [`01-types.md`](01-types.md) | `state` + `error` + events | records, config, errors, events |
 | [`02-ids.md`](02-ids.md) | `ids` / crypto helpers | domain, id hashes, voucher + **receipt** digests, sig verify |
-| [`03-organization.md`](03-organization.md) | org instructions | create / delete + members |
-| [`04-service.md`](04-service.md) | service instructions | create / update / delete (`version++`) |
+| [`03-organization.md`](03-organization.md) | org instructions | create / pause / delete + members |
+| [`04-service.md`](04-service.md) | service instructions | create / update / pause / delete (`version++` on update only) |
 | [`05-channel.md`](05-channel.md) | channel instructions | open, fund, request/cancel/finalize transition |
 | [`06-claim.md`](06-claim.md) | claim instruction | exhausted cleanup / voucher settle |
 | [`07-offchain.md`](07-offchain.md) | spend broker / provider (not the program) | sequential consume, receipts, retries, watchers |
@@ -41,9 +41,11 @@ Helpers are defined once (`02`, `remaining` in `05`) and referenced, never copie
 | Instruction | Caller | File |
 |---|---|---|
 | `create_organization` | future owner | 03 |
+| `set_organization_paused` | owner | 03 |
 | `delete_organization` | owner | 03 |
 | `create_service` | org member | 04 |
 | `update_service` | service owner | 04 |
+| `set_service_paused` | service owner | 04 |
 | `delete_service` | service owner | 04 |
 | `open_channel` | payer | 05 |
 | `fund_channel` | payer | 05 |
@@ -52,7 +54,7 @@ Helpers are defined once (`02`, `remaining` in `05`) and referenced, never copie
 | `finalize_channel_transition` | anyone | 05 |
 | `claim_channel_funds` | anyone | 06 |
 
-Deletes are rejected while children exist. Close channels via a challenged transition first.
+Deletes are rejected while children exist. Close channels via a challenged transition first. Pause the org or service to stop new admission while children drain.
 
 ---
 
@@ -69,6 +71,7 @@ Deletes are rejected while children exist. Close channels via a challenged trans
 9. `delete_service` iff `channels == 0`; `delete_organization` iff `services == 0`.
 10. Asset is explicit/immutable per service; all arithmetic is checked and all state/transfers are atomic.
 11. `fund_channel` requires matching live `service.version` and raises `calls`. Finalized `AdoptTerms` requires a version change, sets `calls = counter + new_quota`, and does not reset `counter`.
+12. `org.paused` or `svc.paused` blocks `create_service`, `open_channel`, and `AdoptTerms` only. Pause does not bump `version` or seize escrow.
 
 v0 vs the original source: deployment-scoped canonical digests; nonce-isolated channels; version-bound vouchers; monotonic counter; per-channel escrow; unchallenged same-term fund; challenged close/AdoptTerms; checked arithmetic and strict counter bounds; result-bound receipts; spend broker; deletes refuse children; member cap enforced; `trials` stored but not billed.
 

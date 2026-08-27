@@ -1,6 +1,6 @@
 # Service
 
-Requires: [`01-types.md`](01-types.md), [`02-ids.md`](02-ids.md).
+Requires: [`01-types.md`](01-types.md), [`02-ids.md`](02-ids.md). Admission helper: [`03-organization.md`](03-organization.md).
 
 `update_service` is a **hard cut for new terms**: every edit increments `version`. Open channels keep their `price`, `version`, `asset`, and `receipt_signer` snapshots. Outstanding vouchers settle during the transition challenge (see 05–06). Same-term extra quota is `fund_channel`. New terms apply only after challenged `AdoptTerms`. `asset` is immutable for a service; publish a new service to change payment asset.
 
@@ -16,6 +16,7 @@ require len(metadata) <= MAX_METADATA_LENGTH    else MetadataTooLong
 
 org = Organizations[(org_owner, org_id)]        else OrganizationNotFound
 require Members[(org_id, caller)] exists        else ServiceNotOrgMember
+require not org.paused                          else OrganizationPaused
 require expiration_threshold > 0                else ChannelInvalidExpiration
 
 reserve(caller, SERVICE_DEPOSIT)                else InsufficientFunds
@@ -27,11 +28,13 @@ org.services = checked_add(org.services, 1)
 Organizations[(org_owner, org_id)] = org
 
 svc = Service {
-  id: service_id, owner: caller, receipt_signer, organization: org_id,
+  id: service_id, owner: caller, org_owner,
+  receipt_signer, organization: org_id,
   name, metadata,
   version: 1,
   asset, price, minimum_calls, expiration_threshold, trials,
-  channels: 0
+  channels: 0,
+  paused: false
 }
 Services[(org_id, service_id)] = svc
 
@@ -69,7 +72,23 @@ Services[(org_id, service_id)] = svc
 emit ServiceUpdated { id: service_id, owner: caller, organization: org_id, version: svc.version }
 ```
 
-Does **not** rewrite open channels or refund them. The spend broker freezes new calls when versions differ. The payer requests a challenged close or `AdoptTerms`; the provider settles old-version vouchers before finalization. Same-term top-up (`fund_channel`) is rejected while versions differ.
+Does **not** rewrite open channels or refund them. The spend broker freezes new calls when versions differ. The payer requests a challenged close or `AdoptTerms`; the provider settles old-version vouchers before finalization. Same-term top-up (`fund_channel`) is rejected while versions differ. Pause (`set_service_paused` / parent `set_organization_paused`) does not bump `version`.
+
+---
+
+## `set_service_paused(org_owner, org_id, service_id, paused)`
+
+Caller = service owner. Blocks `open_channel` and `AdoptTerms` for this service. Existing Open channels may still be funded, claimed, and closed. Does **not** bump `version`. An org-level pause already blocks this service; this flag is the per-offering hold.
+
+```
+org = Organizations[(org_owner, org_id)]        else OrganizationNotFound
+svc = Services[(org_id, service_id)]            else ServiceNotFound
+require caller == svc.owner                     else ServiceNotOwner
+
+svc.paused = paused
+Services[(org_id, service_id)] = svc
+emit ServicePausedSet { id: service_id, owner: caller, organization: org_id, paused }
+```
 
 ---
 

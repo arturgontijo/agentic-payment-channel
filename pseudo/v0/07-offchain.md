@@ -133,6 +133,7 @@ On-chain the provider still submits the **highest** voucher (`sig(5)` cashes cal
 - Window caps count successful broker executions, not a single `sig(100)`.
 - When channel status is `Closing`, stop new delivery. Old-version claims remain valid until transition finalization.
 - After service update, freeze until a challenged `AdoptTerms` snapshots new terms. `counter` continues; new vouchers use the new version from `counter + 1`.
+- Org/service pause does not freeze existing Open delivery. It blocks new channels and `AdoptTerms`.
 - Same-term extra quota: `fund_channel` (no freeze). Quota exhausted at new terms: `AdoptTerms` or open another channel with the next payer nonce.
 
 ---
@@ -163,6 +164,8 @@ Claims may also run periodically while Open. The challenge deadline is the final
 ```
 if user wants more quota and ch.version == live svc.version:
   fund_channel(payer, channel_id, additional_calls)
+if org.paused or svc.paused:
+  AdoptTerms is unavailable; Close to leave
 if user wants to stop, ch.expiration reached, or ch.version != live svc.version:
   request_channel_transition(payer, channel_id, Close or AdoptTerms)
 after close_after:

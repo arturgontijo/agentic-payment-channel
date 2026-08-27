@@ -33,6 +33,7 @@ Organization {
   metadata:  Bytes
   members:   u32              // including owner
   services:  u32
+  paused:    bool             // admission hold; default false
 }
 
 // storage: Members[(org_id, account)] -> Rank
@@ -41,6 +42,7 @@ Organization {
 Service {
   id:                    Hash256   // hash_service_id(service_owner, name)
   owner:                 AccountId // receives claims
+  org_owner:             AccountId // parent org owner (lookup key)
   receipt_signer:        AccountId // signs off-chain delivery receipts
   organization:          Hash256
   name:                  Bytes
@@ -52,6 +54,7 @@ Service {
   expiration_threshold:  Time
   trials:                u32       // stored; not enforced in v0
   channels:              u32       // open channels against this service
+  paused:                bool      // admission hold; default false
 }
 
 ChannelStatus =
@@ -101,6 +104,8 @@ if status is Closing/AdoptTerms:
   PENDING_ESCROW balance == status.action.funds
 ```
 
+Admission: `org.paused` or `svc.paused` blocks `create_service`, `open_channel`, and `AdoptTerms`. It does **not** bump `version`, freeze existing Open channels, or block `fund_channel`, claims, Close, cancel, or finalize. Pause is not a substitute for challenged close.
+
 All arithmetic is checked. Overflow/underflow aborts the whole transaction; never saturate or partially update state.
 
 ---
@@ -123,7 +128,9 @@ PENDING_ESCROW(channel_id)           -> pre-funded AdoptTerms escrow (Closing on
 
 ```
 OrganizationExists, OrganizationNotFound, OrganizationNotOwner, OrganizationHasServices
+OrganizationPaused
 ServiceExists, ServiceNotFound, ServiceNotOwner, ServiceNotOrgMember, ServiceHasOpenChannels
+ServicePaused
 ChannelExists, ChannelNonceMismatch, ChannelNotFound, ChannelNotOwner, ChannelLowNumberOfCalls
 ChannelInvalidExpiration
 ChannelNotOpen, ChannelNotClosing, ChallengeNotElapsed, InvalidChallengePeriod
@@ -139,10 +146,12 @@ TooManyMembers, NameTooLong, MetadataTooLong
 
 ```
 OrganizationCreated { id, owner, members }
+OrganizationPausedSet { id, owner, paused }
 OrganizationDeleted { id, owner }
 
 ServiceCreated { id, owner, organization, asset, price, receipt_signer }
 ServiceUpdated { id, owner, organization, version }
+ServicePausedSet { id, owner, organization, paused }
 ServiceDeleted { id, owner, organization }
 
 ChannelCreated { id, owner, nonce, organization, service, version, asset, calls, funds, expiration }

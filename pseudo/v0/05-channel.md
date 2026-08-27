@@ -1,6 +1,6 @@
 # Channel (open / fund / challenged close or adopt-terms)
 
-Requires: [`01-types.md`](01-types.md), [`02-ids.md`](02-ids.md). Claim / close: [`06-claim.md`](06-claim.md).
+Requires: [`01-types.md`](01-types.md), [`02-ids.md`](02-ids.md), `require_admitting` from [`03-organization.md`](03-organization.md). Claim / close: [`06-claim.md`](06-claim.md).
 
 ---
 
@@ -18,10 +18,12 @@ Always use channel snapshots. All transfers and state changes are atomic; any ch
 
 ## `open_channel(org_id, service_id, nonce, calls)`
 
-Caller = `payer`. Client supplies the current protocol-assigned `NextChannelNonce[payer]` (normally maps this channel to one agent). Locks `service.price × calls` into isolated escrow and snapshots terms.
+Caller = `payer`. Client supplies the current protocol-assigned `NextChannelNonce[payer]` (normally maps this channel to one agent). Locks `service.price × calls` into isolated escrow and snapshots terms. Rejected while the organization or service is paused.
 
 ```
 svc = Services[(org_id, service_id)]            else ServiceNotFound
+org = Organizations[(svc.org_owner, org_id)]    else OrganizationNotFound
+require_admitting(org, svc)
 require calls >= svc.minimum_calls              else ChannelLowNumberOfCalls
 require nonce == NextChannelNonce[payer]         else ChannelNonceMismatch
 
@@ -87,7 +89,7 @@ emit ChannelFunded {
 }
 ```
 
-If live `service.version` differs, use `request_channel_transition(AdoptTerms)` instead. Do not re-price in place.
+If live `service.version` differs, use `request_channel_transition(AdoptTerms)` instead. Do not re-price in place. Pause does not block `fund_channel`.
 
 ---
 
@@ -95,7 +97,7 @@ If live `service.version` differs, use `request_channel_transition(AdoptTerms)` 
 
 Caller = channel owner. `action` is `Close` or `AdoptTerms { calls }`.
 
-This instruction moves the channel to `Closing`; off-chain delivery must stop. It does not refund or invalidate the current version. `AdoptTerms` is for a **terms change** (`service.version != channel.version`): it snapshots live terms and pre-funds a new remaining quota now, while the payer is authorizing the transaction. Providers may keep settling old-version vouchers until finalization. Same-term extra quota is `fund_channel`, not this instruction.
+This instruction moves the channel to `Closing`; off-chain delivery must stop. It does not refund or invalidate the current version. `AdoptTerms` is for a **terms change** (`service.version != channel.version`): it snapshots live terms and pre-funds a new remaining quota now, while the payer is authorizing the transaction. Providers may keep settling old-version vouchers until finalization. Same-term extra quota is `fund_channel`, not this instruction. `AdoptTerms` is rejected while the organization or service is paused; `Close` is not.
 
 ```
 require caller == payer                         else ChannelNotOwner
@@ -104,6 +106,8 @@ svc = Services[(ch.organization, ch.service)]   else ServiceNotFound
 require ch.status == Open                       else ChannelNotOpen
 
 if requested action is AdoptTerms { calls }:
+  org = Organizations[(svc.org_owner, ch.organization)] else OrganizationNotFound
+  require_admitting(org, svc)
   require svc.version != ch.version             else ChannelTermsUnchanged
   require calls >= svc.minimum_calls            else ChannelLowNumberOfCalls
   require svc.asset == ch.asset                 else AssetMismatch
