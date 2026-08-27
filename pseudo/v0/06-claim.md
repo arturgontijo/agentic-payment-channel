@@ -4,7 +4,7 @@ Requires: [`01-types.md`](01-types.md), [`02-ids.md`](02-ids.md), `remaining()` 
 
 Anyone may call. Voucher payout always goes to `service.owner`, never the submitter.
 
-Claims remain valid while a channel is `Open` **or** `Closing`, including after service version changes and expiry. A payer never receives an immediate refund: close/rollover uses the challenge state machine in [`05-channel.md`](05-channel.md).
+Claims remain valid while a channel is `Open` **or** `Closing`, including after service version changes and expiry. A payer never receives an immediate refund: close/AdoptTerms uses the challenge state machine in [`05-channel.md`](05-channel.md). Same-term top-up is `fund_channel` and does not freeze claims.
 
 ---
 
@@ -21,8 +21,8 @@ n    = counter ?? 0
 
 // ---- Path A: exhausted cleanup ----------------------------------------------
 if left == 0:
-  // Preserve a requested rollover: finalization will fund the next epoch.
-  if ch.status is Closing { action: Rollover }:
+  // Preserve a requested AdoptTerms: finalization will fund the new remaining quota.
+  if ch.status is Closing { action: AdoptTerms }:
     return
 
   svc.channels = checked_sub(svc.channels, 1)
@@ -33,11 +33,15 @@ if left == 0:
   return
 
 // ---- Path B: voucher settlement ---------------------------------------------
-require n > ch.counter                          else ClaimLowCounter
+require n > 0                                   else ClaimLowCounter
 require n <= ch.calls                           else ClaimCounterTooHigh
+require n >= ch.counter                         else ClaimLowCounter
 sig = signature                                 else ClaimInvalidSignature
-verify_voucher(ch.owner, channel_id, ch.epoch, ch.version, n, sig)
-  // channel epoch/version snapshots, never live svc.version
+verify_voucher(ch.owner, channel_id, ch.version, n, sig)
+  // channel version snapshot, never live svc.version
+
+if n == ch.counter:
+  return                                        // idempotent: already settled, zero claim
 
 delta = checked_sub(n, ch.counter)
 claim = checked_mul(ch.price, delta)            // snapshotted price
@@ -49,10 +53,10 @@ ch.counter = n
 Channels[(payer, channel_id)] = ch
 
 emit ChannelClaimed {
-  id: channel_id, epoch: ch.epoch, by: caller, counter: n, funds: claim
+  id: channel_id, by: caller, counter: n, funds: claim
 }
 ```
 
-Channel stays present after voucher settlement, even if `counter == calls`; a later call with no voucher performs exhausted cleanup. For `Closing/Rollover`, exhausted state remains until transition finalization.
+Channel stays present after voucher settlement, even if `counter == calls`; a later call with no voucher performs exhausted cleanup. For `Closing/AdoptTerms`, exhausted state remains until transition finalization.
 
-There is no cap-and-continue behavior: `n > calls`, overflow, asset mismatch, or insufficient escrow aborts. State and balances update atomically.
+Re-submitting the exact already-settled voucher is a zero-payout no-op after signature verification. There is no cap-and-continue behavior: `n > calls`, overflow, asset mismatch, or insufficient escrow aborts. State and balances update atomically. `counter` never decreases.

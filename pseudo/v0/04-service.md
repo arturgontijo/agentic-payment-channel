@@ -2,7 +2,7 @@
 
 Requires: [`01-types.md`](01-types.md), [`02-ids.md`](02-ids.md).
 
-`update_service` is a **hard cut for new terms**: every edit increments `version`. Open channel epochs keep their `price`, `version`, `asset`, and `receipt_signer` snapshots. Outstanding vouchers settle during the transition challenge (see 05–06). `asset` is immutable for a service; publish a new service to change payment asset.
+`update_service` is a **hard cut for new terms**: every edit increments `version`. Open channels keep their `price`, `version`, `asset`, and `receipt_signer` snapshots. Outstanding vouchers settle during the transition challenge (see 05–06). Same-term extra quota is `fund_channel`. New terms apply only after challenged `AdoptTerms`. `asset` is immutable for a service; publish a new service to change payment asset.
 
 ---
 
@@ -69,7 +69,7 @@ Services[(org_id, service_id)] = svc
 emit ServiceUpdated { id: service_id, owner: caller, organization: org_id, version: svc.version }
 ```
 
-Does **not** rewrite open epochs or refund them. The spend broker freezes new calls when versions differ. The payer requests a challenged rollover/close; the provider settles old vouchers before finalization.
+Does **not** rewrite open channels or refund them. The spend broker freezes new calls when versions differ. The payer requests a challenged close or `AdoptTerms`; the provider settles old-version vouchers before finalization. Same-term top-up (`fund_channel`) is rejected while versions differ.
 
 ---
 

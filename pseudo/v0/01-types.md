@@ -12,7 +12,7 @@ Every channel has an isolated program-owned `ESCROW(channel_id, asset)`. A poole
 |---|---|
 | `PROTOCOL_VERSION` | Fixed encoding version (`0` for this spec). |
 | `CHAIN_ID` / `PROGRAM_ID` | Deployment identity included in every signed/hash domain. |
-| `CLOSE_CHALLENGE_PERIOD` | Time after a transition request during which old-epoch vouchers may settle. Must be non-zero. |
+| `CLOSE_CHALLENGE_PERIOD` | Time after a Close / AdoptTerms request during which old-version vouchers may settle. Must be non-zero. |
 | `ORGANIZATION_DEPOSIT` | Reserved from owner on org create; unreserved on delete. |
 | `SERVICE_DEPOSIT` | Reserved from service owner on create; unreserved on delete. |
 | `MAX_ORG_MEMBERS` | Cap on member list at org create (owner counts as 1). |
@@ -61,8 +61,8 @@ ChannelStatus =
       close_after:  Time,
       action:
         Close
-        | Rollover {
-            calls: u32,
+        | AdoptTerms {
+            calls: u32,                 // new remaining quota at new terms
             version: u32,
             receipt_signer: AccountId,
             asset: AssetId,
@@ -78,27 +78,26 @@ Channel {
   nonce:         ChannelNonce // protocol-assigned monotonic payer nonce
   organization:  Hash256
   service:       Hash256
-  epoch:         u32        // starts 1; ++ after finalized rollover
-  version:       u32        // service version snapshotted per epoch
-  receipt_signer: AccountId // service receipt key snapshotted per epoch
-  asset:         AssetId    // service asset snapshotted per epoch
-  price:         Balance    // snapshotted per epoch
-  calls:         u32        // prepaid quota
-  counter:       u32        // highest settled count; starts 0
-  expiration:    Time       // now() + service.expiration_threshold
+  version:       u32        // service version snapshotted at open / AdoptTerms
+  receipt_signer: AccountId // service receipt key snapshotted at open / AdoptTerms
+  asset:         AssetId    // service asset snapshotted at open / AdoptTerms
+  price:         Balance    // snapshotted at open / AdoptTerms
+  calls:         u32        // prepaid ceiling; grows on fund / AdoptTerms
+  counter:       u32        // highest settled count; starts 0; never resets
+  expiration:    Time       // refreshed on fund / AdoptTerms
   status:        ChannelStatus
 }
 ```
 
-The nonce permits parallel channels for the same payer/service (normally one per agent). `NextChannelNonce[payer]` only increases, so a closed channel id cannot reopen and old vouchers cannot replay. Live service edits do **not** rewrite open epochs.
+The nonce permits parallel channels for the same payer/service (normally one per agent). `NextChannelNonce[payer]` only increases, so a closed channel id cannot reopen and old vouchers cannot replay. Live service edits do **not** rewrite open channels. `counter` never resets: same-term top-ups raise `calls`; terms changes keep `counter` and bind new vouchers to the new `version`.
+
+If `calls` would exceed `u32` max, open a new channel with the next payer nonce.
 
 ```
 require channel.counter ≤ channel.calls
-funds     = checked_mul(channel.price, channel.calls)
 remaining = checked_mul(channel.price, channel.calls − channel.counter)
-
-if status is Closing/Rollover:
-  active ESCROW balance == remaining
+active ESCROW balance == remaining
+if status is Closing/AdoptTerms:
   PENDING_ESCROW balance == status.action.funds
 ```
 
@@ -115,7 +114,7 @@ Services[(org_id, service_id)]       -> Service
 Channels[(payer, channel_id)]        -> Channel
 NextChannelNonce[payer]              -> ChannelNonce
 ESCROW(channel_id, asset)            -> isolated program-owned escrow
-PENDING_ESCROW(channel_id, epoch+1)  -> pre-funded rollover escrow (Closing only)
+PENDING_ESCROW(channel_id)           -> pre-funded AdoptTerms escrow (Closing only)
 ```
 
 ---
@@ -128,6 +127,7 @@ ServiceExists, ServiceNotFound, ServiceNotOwner, ServiceNotOrgMember, ServiceHas
 ChannelExists, ChannelNonceMismatch, ChannelNotFound, ChannelNotOwner, ChannelLowNumberOfCalls
 ChannelInvalidExpiration
 ChannelNotOpen, ChannelNotClosing, ChallengeNotElapsed, InvalidChallengePeriod
+ChannelTermsChanged, ChannelTermsUnchanged
 ClaimLowCounter, ClaimCounterTooHigh, ClaimNotEnoughFunds, ClaimInvalidSignature
 InsufficientFunds, ArithmeticOverflow, AssetMismatch
 TooManyMembers, NameTooLong, MetadataTooLong
@@ -145,11 +145,12 @@ ServiceCreated { id, owner, organization, asset, price, receipt_signer }
 ServiceUpdated { id, owner, organization, version }
 ServiceDeleted { id, owner, organization }
 
-ChannelCreated { id, owner, nonce, organization, service, epoch, version, asset, calls, funds, expiration }
+ChannelCreated { id, owner, nonce, organization, service, version, asset, calls, funds, expiration }
+ChannelFunded { id, owner, additional_calls, calls, funds, expiration }
 ChannelTransitionRequested { id, owner, action, close_after }
 ChannelTransitionCancelled { id, owner }
-ChannelRolledOver { id, owner, epoch, version, calls, funds, expiration }
-ChannelClaimed { id, epoch, by, counter, funds }       // voucher settle
-ChannelClosed { id, by, funds }                        // finalized refund
-ChannelDeleted { id, by, funds }                       // exhausted cleanup
+ChannelTermsAdopted { id, owner, version, calls, funds, expiration }
+ChannelClaimed { id, by, counter, funds }          // voucher settle (funds > 0)
+ChannelClosed { id, by, funds }                    // finalized refund
+ChannelDeleted { id, by, funds }                   // exhausted cleanup
 ```

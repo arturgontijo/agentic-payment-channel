@@ -29,7 +29,7 @@ Needed:
 
 | Attacker | Assumption | What must still hold |
 |---|---|---|
-| Runaway or injected agent | Can call broker `execute` | Cannot choose counters, see vouchers, skip receipts, open channels, or export keys |
+| Runaway or injected agent | Can call broker `execute` | Cannot choose counters, see vouchers, skip receipts, open/fund channels, or export keys |
 | Malicious / buggy service | Tries to jump counter or falsify a result | Broker rejects jumps/bad hashes; isolated escrow remains the hard cap |
 | Compromised agent identity | Can request broker executions as that agent | Damage ≤ capability windows and channel escrow; receipts still gate honest-provider calls; human can revoke |
 | Compromised broker/KMS | Can sign as payer or dump its hot tranche | Damage ≤ affected channel escrows / highest hot rungs; keep both small |
@@ -54,7 +54,7 @@ Even a fully compromised agent plus an abused broker API cannot spend more than 
 
 ```
 Human owner
-  │  policies, allowlists, channel transitions, revoke
+  │  policies, allowlists, fund/close/AdoptTerms, revoke
   │  optional: airgap-sign a voucher ladder, load vault in tranches
   ▼
 Spend broker (vault/KMS + durable state)
@@ -89,7 +89,7 @@ unsettled IOU    = price × (dispensed − settled)
 unused_lock      = price × (calls − dispensed)
 ```
 
-The broker ledger is source of truth for limits/receipts. The chain is source of truth for settlement.
+The broker ledger is source of truth for limits/receipts. The chain is source of truth for settlement. These counters share one number line for the life of the channel: `fund_channel` raises `calls`; AdoptTerms continues from the same `dispensed` / `counter`.
 
 ---
 
@@ -97,7 +97,7 @@ The broker ledger is source of truth for limits/receipts. The chain is source of
 
 ### 1. On-chain envelope (hard, coarse)
 
-Opening a nonce-isolated channel **is** the human committing one asset to one service/agent. Keep `calls` small (hours of expected use, not months). The agent cannot open, resize, close, or roll over channels.
+Opening a nonce-isolated channel **is** the human committing one asset to one service/agent. Keep `calls` small (hours of expected use, not months). Top up with `fund_channel` rather than a huge initial lock. The agent cannot open, fund, close, or adopt terms.
 
 This is the last backstop if policy fails. Isolated escrows bound blast radius per agent/task.
 
@@ -113,7 +113,7 @@ Capability {
   payer:              AccountId
   allowlist:          [ {
     org_id, service_id, channel_id, nonce,
-    epoch, version, asset, receipt_signer
+    version, asset, receipt_signer
   } ]
   max_counter:        u32                // ≤ channel.calls; per channel
   max_amount:         Balance            // optional cap across services
@@ -129,13 +129,15 @@ Checks on `execute(capability, channel, idempotency_key, request)` ([pseudo/v0/0
 
 1. Capability not expired / not revoked.
 2. `channel_id` in allowlist.
-3. Channel is `Open`; epoch/version/asset/receipt signer match the pin.
+3. Channel is `Open`; version/asset/receipt signer match the pin.
 4. `dispensed == acked` (otherwise retry the same outstanding request).
 5. Broker chooses `n = dispensed + 1`; `n ≤ max_counter` and `n ≤ channel.calls`.
 6. Window still has room.
-7. Response receipt binds `channel_id`, epoch/version, `n`, request hash, and result hash.
+7. Response receipt binds `channel_id`, version, `n`, request hash, and result hash.
 
 On success: broker durably stores the result/receipt and advances `acked` before returning only the result. Receipts do not go on-chain.
+
+After `fund_channel`, raise `max_counter` and load extra rungs. After AdoptTerms, re-pin version and load a new ladder from `counter + 1`.
 
 ### 3. Human gates (rare, high impact)
 
@@ -143,25 +145,25 @@ Vault roles:
 
 | Role | Auth | Allowed |
 |---|---|---|
-| **Root / owner** | Hardware key, 2FA | Create payer keys, set policies, open/update/close channels, revoke, export never |
+| **Root / owner** | Hardware key, 2FA | Create payer keys, set policies, open/fund/close/AdoptTerms, revoke, export never |
 | **Approver** | Same or a second human | Optional: signatures with `Δamount` above a threshold |
 | **Agent** | Workload identity (short-lived JWT / SPIFFE / vault AppRole) | `execute` only |
 
-Do not expose `next_voucher`, raw signing, `open_channel`, or transition instructions to the agent role.
+Do not expose `next_voucher`, raw signing, `open_channel`, `fund_channel`, or transition instructions to the agent role.
 
 ---
 
 ## Least-privilege key
 
-The payer key in the KMS must be **unable** to do anything except channel vouchers (and, under the human role, the eight channel instructions).
+The payer key in the KMS must be **unable** to do anything except channel vouchers (and, under the human role, the channel instructions).
 
 If that key can `transfer` or sign arbitrary bytes, policy is theater.
 
 Practical shapes:
 
-- **Message-policy KMS**: allow only canonical voucher digests `(deployment, channel_id, epoch, version, counter)`.
+- **Message-policy KMS**: allow only canonical voucher digests `(deployment, channel_id, version, counter)`.
 - **Dedicated spend account**: zero extra balance; the only value it controls is already inside channels. Even a leaked key cannot steal funds that were never locked.
-- **Split roles**: `funding_key` (human, holds idle capital) vs `payer_key` (vault, only used as channel owner). Human transfers into the payer just enough to open the next small channel.
+- **Split roles**: `funding_key` (human, holds idle capital) vs `payer_key` (vault, only used as channel owner). Human transfers into the payer just enough to open or fund the next small channel.
 
 Prefer a dedicated spend account **and** message policy. Then a leak of `payer_key` still cannot empty the human’s main wallet, and cannot sign a voucher the policy would have rejected *if the leak is of the agent API rather than the KMS itself*. A raw leak of `payer_key` bypasses policy — hence keep that material in HSM/KMS, never in the agent runtime, never in logs.
 
@@ -171,13 +173,15 @@ Prefer a dedicated spend account **and** message policy. Then a leak of `payer_k
 
 Hot signing keeps the payer key **online** in a KMS. The alternative: the human signs offline, stores **only the signatures** in the vault, and never gives the vault (or the agent) the key.
 
-Example: open a $100 channel at $0.01/call → `calls = 10_000`. Human signs the epoch's ladder (`counter = 1 … 10_000`) offline. The full ladder remains encrypted under offline/HSM-controlled wrapping keys; only a small current tranche is loaded into the broker. The agent never fetches a signature.
+Example: open a $100 channel at $0.01/call → `calls = 10_000`. Human signs the ladder (`counter = 1 … 10_000`) offline. The full ladder remains encrypted under offline/HSM-controlled wrapping keys; only a small current tranche is loaded into the broker. The agent never fetches a signature.
+
+Same-term top-up is append-only: if `calls` becomes `12_000`, sign `10_001 … 12_000` at the same version. After AdoptTerms, sign a new ladder from the latest `counter + 1` at the new version.
 
 That works. Two properties of this protocol change how you should store and release them.
 
 ### Cumulative IOUs, not tickets
 
-Vouchers replace each other. `sig(100)` pays `price × 100` by itself. `sig(1) … sig(99)` are worthless once `sig(100)` exists.
+Vouchers replace each other. `sig(100)` pays `price × (100 − already_settled)` by itself. `sig(1) … sig(99)` are worthless once `sig(100)` is settled. Re-submitting `sig(100)` after settlement is a zero claim.
 
 Loading the first 100 signatures is economically one permission: raise authorized counter to 100 ($1). A broker/storage compromise needs only the last row. Treat the highest online counter as the hot exposure.
 
@@ -185,7 +189,7 @@ You do not need 10_000 hot rows for a 100/day budget. That budget is a broker wi
 
 | Goal | What to pre-sign | What to dispense |
 |---|---|---|
-| Sequential calls (default) | `1, 2, 3, …, 10_000` | Broker internally uses only `sig(dispensed + 1)` |
+| Sequential calls (default) | `1, 2, 3, …, 10_000` (then `10_001…` on fund) | Broker internally uses only `sig(dispensed + 1)` |
 | Coarse *budget* (not sequential) | `100, 200, …` | One rung = one day’s max claim — **do not use for agents** that must call +1 |
 
 Agent mode is the first row. See [Forced sequential execution](#forced-sequential-execution-broker-gated).
@@ -210,7 +214,8 @@ Load the next tranche like a till. Revoke stops broker execution; request a chal
 |---|---|---|
 | Payer key | Online in KMS | Offline after the batch; vault has no key |
 | Broker | Requests a fresh signature internally | Consumes the next stored payload internally |
-| Version bump | Freeze; human re-approves | Old ladder remains claimable during challenge; new ladder follows finalized rollover |
+| Version bump | Freeze; human re-approves | Old ladder remains claimable during challenge; new ladder starts at `counter+1` after AdoptTerms |
+| Same-term fund | Sign / load extra rungs | Append rungs at the same version |
 | Revoke unused | Easy (never signed) | Only unreleased rungs; released/stolen `sig(n)` still works |
 | Per-call sequencing | Broker signs one next counter | Broker consumes one next rung |
 | Broker/KMS compromise | Can sign up to channel escrow | Can spend up to highest hot signature |
@@ -228,7 +233,7 @@ execute(idempotency_key, request):
   require dispensed == acked
   n = dispensed + 1
   atomically persist dispensed = n and request_hash
-  send request + sig(epoch, n)
+  send request + sig(version, n)
   verify receipt(request_hash, result_hash)
   atomically persist acked = n and result
   return result                    # signature is never returned
@@ -240,16 +245,16 @@ On loss, retry the same `n` and idempotency key. Never allocate `n+1` while one 
 
 On-chain claims may jump (`0 → 5` in one tx). That is settlement, not delivery.
 
-The service accepts only `n == last_accepted + 1` for the current epoch. A billed success is a durable `{ result, receipt }` record:
+The service accepts only `n == last_accepted + 1` for the current Open version. A billed success is a durable `{ result, receipt }` record:
 
 ```
 sign_provider(H(
-  DOMAIN || "receipt" || channel_id || epoch || version || n
+  DOMAIN || "receipt" || channel_id || version || n
   || request_hash || result_hash
 ))
 ```
 
-The broker pins `channel.receipt_signer`. Provider persists the request hash, complete result, result hash, receipt, and highest voucher under `(channel, epoch, n)`. A retry returns exactly that stored record and never repeats the upstream call.
+The broker pins `channel.receipt_signer`. Provider persists the request hash, complete result, result hash, receipt, and highest voucher under `(channel, n)`. A retry returns exactly that stored record and never repeats the upstream call.
 
 ### What receipts force — and what they do not
 
@@ -275,8 +280,9 @@ Maps onto [RESEARCH.md](RESEARCH.md) instructions.
 |---|---|---|
 | `create/delete` org/service | Provider, not this flow | — |
 | `open_channel` | Human via vault | Locks money |
-| `request/cancel` channel transition | Human via vault | Starts/stops challenged close/rollover |
-| `finalize_channel_transition` | Anyone | Refunds/rolls over after challenge; funds always follow protocol |
+| `fund_channel` | Human via vault | Same-term top-up |
+| `request/cancel` channel transition | Human via vault | Starts/stops challenged close / AdoptTerms |
+| `finalize_channel_transition` | Anyone | Refunds / adopts terms after challenge; funds always follow protocol |
 | Voucher | Spend broker (pre-signed rung or hot KMS) | Internal only; agent never sees it |
 | Receipt | Service/gateway `channel.receipt_signer` | Binds request/result hashes; off-chain only |
 | `claim_channel_funds` (voucher settlement) | Provider | Agent is not the claimer |
@@ -294,7 +300,7 @@ Every successful sign writes an append-only audit event:
 ```
 Audit {
   time, agent_id, channel_id, service_id,
-  epoch, counter, request_hash, result_hash,
+  version, counter, request_hash, result_hash,
   dispensed, acked, settled, locked,
   capability_id, idempotency_key
 }
@@ -306,7 +312,7 @@ Dashboards for the human:
 - Per service: locked vs dispensed vs settled.
 - Alerts: window 80%, near `max_counter`, snapshot/status freeze, invalid receipt spikes, outstanding request stuck.
 
-Reconciliation is per `(channel, epoch)`: `acked` (broker receipts) vs `channel.counter` (chain). If `settled > dispensed`, a voucher escaped the broker or state was corrupted. If `dispensed − acked > 1`, the broker concurrency guard failed.
+Reconciliation is per channel: `acked` (broker receipts) vs `channel.counter` (chain). If `settled > dispensed`, a voucher escaped the broker or state was corrupted. If `dispensed − acked > 1`, the broker concurrency guard failed.
 
 ---
 
@@ -316,7 +322,7 @@ Most APIs will not verify vouchers. Two consumption modes:
 
 ### A. Native service
 
-The spend broker calls the API. The API implements [pseudo/v0/07-offchain.md](../pseudo/v0/07-offchain.md): accept `counter + 1` for the current epoch, execute idempotently, return `{ result, receipt(request_hash, result_hash) }`, and keep the highest voucher for claim.
+The spend broker calls the API. The API implements [pseudo/v0/07-offchain.md](../pseudo/v0/07-offchain.md): accept `counter + 1` for the current Open version, execute idempotently, return `{ result, receipt(request_hash, result_hash) }`, and keep the highest voucher for claim.
 
 ### B. Metering gateway (default for “any HTTP API”)
 
@@ -361,11 +367,12 @@ agent loop:
 
 human anytime:
   revoke capability
-  request_channel_transition(Close or Rollover)
+  fund_channel(additional_calls)                 # same terms
+  request_channel_transition(Close or AdoptTerms)
   after challenge: finalize_channel_transition
 ```
 
-If service terms change, broker freezes. Human requests rollover; provider settles old-epoch vouchers during the challenge; finalization increments epoch and snapshots new terms. Human loads a new epoch ladder/capability. The agent cannot silently re-price.
+If service terms change, broker freezes. Human requests AdoptTerms; provider settles old-version vouchers during the challenge; finalization snapshots new terms and keeps `counter`. Human loads a new ladder/capability from `counter + 1`. The agent cannot silently re-price.
 
 ---
 
@@ -373,7 +380,7 @@ If service terms change, broker freezes. Human requests rollover; provider settl
 
 - Put a seed phrase or payer key in the agent prompt, env, or tool-calling host.
 - Reuse the human’s main wallet as `payer`.
-- Let the agent call raw signing, `open_channel`, or transition instructions.
+- Let the agent call raw signing, `open_channel`, `fund_channel`, or transition instructions.
 - Return vouchers from the broker API or dump `sig(1)…sig(k)` to the agent.
 - Skip result-hash receipts or let agent/metadata choose `receipt_signer`.
 - Treat provider invoices as the spend log. The broker’s `acked` counter is the owner-side truth.
@@ -388,7 +395,7 @@ If service terms change, broker freezes. Human requests rollover; provider settl
 |---|---|
 | Agent misbehaving | Revoke capability (seconds). Optionally freeze all capabilities on that `payer`. |
 | Stolen agent JWT | Rotate workload identity; revoke old capability id. |
-| Lost response after execution | Broker retries the same `(epoch, n, idempotency_key, request_hash)`; provider returns stored result+receipt. |
+| Lost response after execution | Broker retries the same `(version, n, idempotency_key, request_hash)`; provider returns stored result+receipt. |
 | Service compromised | Remove from allowlist; freeze broker; request challenged close; provider may claim already-issued vouchers. |
 | Broker API abused | Still bounded by capabilities, receipt gate, tranche, and escrow; rotate agent identities; inspect audit. |
 | KMS key leak **or** full ladder dump | Worst case: all open channels for that payer, or `price × max stored counter`. Close/refund; treat unclaimed high vouchers as spent. Keep **hot** rungs small. |
@@ -404,12 +411,13 @@ Minimum surface. Not on-chain.
 # human
 create_payer_key()
 open_channel(service, nonce, calls)
-request_channel_transition(channel, Close | Rollover { calls })
+fund_channel(channel, additional_calls)
+request_channel_transition(channel, Close | AdoptTerms { calls })
 cancel_channel_transition(channel)
 finalize_channel_transition(channel)
 put_capability(Capability)
 revoke_capability(id)
-load_encrypted_tranche(channel_id, epoch, rungs)
+load_encrypted_tranche(channel_id, version, rungs)
 
 # agent — no signature API
 execute(capability_id, channel_id, idempotency_key, request) -> result
@@ -417,17 +425,16 @@ execute(capability_id, channel_id, idempotency_key, request) -> result
 #         DenyRevoked | DenyChannelClosing | IncompleteResponse | DenyReceipt
 ```
 
-Broker state: capabilities; `dispensed/acked` per `(agent, channel, epoch)`; windows; audit; cached snapshots/status; current encrypted tranche; outstanding idempotency/request hash; verified result/receipt. Updates use durable transactions/CAS.
+Broker state: capabilities; `dispensed/acked` per `(agent, channel)`; windows; audit; cached snapshots/status; current encrypted tranche; outstanding idempotency/request hash; verified result/receipt. Updates use durable transactions/CAS.
 
 ---
 
 ## Fit with v0 / v1
 
-v0 includes nonce-isolated channels, epochs, challenged transitions, explicit assets, and deployment-scoped vouchers. One agent/task should have one nonce/channel.
+v0 includes nonce-isolated channels, version-bound vouchers, monotonic counters, `fund_channel`, challenged close/AdoptTerms, explicit assets, and deployment-scoped vouchers. One agent/task should have one nonce/channel.
 
 Nice-to-have later (do not block v0):
 
-- `fund_channel` without resetting `counter` so the human tops up without invalidating in-flight vouchers.
 - Provider bonds/disputes, TEEs, or verifiable computation for stronger delivery assurance.
 
 The broker does not prove semantic delivery; it makes v0 safely operable under the stated provider/gateway trust model.
@@ -439,11 +446,11 @@ The broker does not prove semantic delivery; it makes v0 safely operable under t
 For a human running agents against mixed APIs:
 
 1. Dedicated payer account; one protocol-assigned next-nonce channel per agent/task.
-2. Pre-signed epoch ladder encrypted under offline/HSM wrapping keys; broker holds only a small tranche. Hot KMS signing only if batching is impractical.
+2. Pre-signed ladder encrypted under offline/HSM wrapping keys; broker holds only a small tranche. Append rungs on `fund_channel`. Hot KMS signing only if batching is impractical.
 3. Metering gateway as the on-chain service, one gateway-service per upstream.
 4. Small per-channel escrow, short TTL, modest calls, non-zero challenge period.
 5. Agent calls broker `execute`; no raw voucher endpoint. Provider accepts only `counter+1` and returns request/result-bound receipt.
-6. Freeze on status/snapshot change; challenged rollover increments epoch; then load a new ladder/capability.
+6. Freeze on status/snapshot change; challenged AdoptTerms keeps `counter` and re-pins version; then load a new ladder/capability from `counter+1`.
 7. Revoke at job end and request challenged close; future rungs remain encrypted offline.
 
 The chain limits how much can leave escrow. The broker limits who may spend, on which channel, and how fast; it is the only component through which an agent may request paid work.

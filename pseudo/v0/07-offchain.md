@@ -1,6 +1,6 @@
 # Off-chain protocol
 
-The program never sees individual calls, payloads, API keys, or receipts. It is escrow + voucher verification + challenged transitions.
+The program never sees individual calls, payloads, API keys, or receipts. It is escrow + voucher verification + fund + challenged transitions.
 
 Voucher and receipt layouts: [`02-ids.md`](02-ids.md). Receipts are **spend-broker / delivery** only. On-chain claim still uses the highest payer voucher.
 
@@ -17,7 +17,7 @@ agent                    spend broker                    provider/gateway
   |---------------------------->|                               |
   |                             | require channel Open          |
   |                             | n = dispensed + 1             |
-  |                             | attach sig(epoch,n)           |
+  |                             | attach sig(version, n)        |
   |                             |------------------------------>|
   |                             |                               | require n == expected
   |                             |                               | verify voucher
@@ -41,7 +41,7 @@ dispensed[(agent, channel)]  = 0    # last voucher sent to provider
 execute(capability_id, channel_id, idempotency_key, request) -> result
   require capability live, channel allowlisted
   require channel.status == Open else DenyChannelClosing
-  require (channel.epoch, channel.version, channel.receipt_signer,
+  require (channel.version, channel.receipt_signer,
            channel.asset) == capability pin else DenySnapshot
   require dispensed == acked else retry outstanding request
 
@@ -57,7 +57,7 @@ execute(capability_id, channel_id, idempotency_key, request) -> result
   require response contains result + receipt else IncompleteResponse
   result_hash = H(canonical(response.result))
   require receipt fields == {
-    channel_id, channel.epoch, channel.version, n,
+    channel_id, channel.version, n,
     request_hash, result_hash
   } else DenyReceipt
   verify_receipt(channel.receipt_signer, …) else DenyReceipt
@@ -66,25 +66,27 @@ execute(capability_id, channel_id, idempotency_key, request) -> result
   return result
 ```
 
-If the network fails while `dispensed == acked + 1`, retry the **same** `(epoch, n, idempotency_key, request_hash, voucher)`; never allocate `n+1`. Use a database transaction / row lock / compare-and-swap so concurrent agent calls cannot duplicate or skip counters.
+If the network fails while `dispensed == acked + 1`, retry the **same** `(version, n, idempotency_key, request_hash, voucher)`; never allocate `n+1`. Use a database transaction / row lock / compare-and-swap so concurrent agent calls cannot duplicate or skip counters.
+
+After `fund_channel`, `calls` is higher and `version` is unchanged: load additional rungs `old_calls+1 … new_calls` and raise `max_counter`. After finalized `AdoptTerms`, pin the new version and load a new ladder from `counter+1` to the new `calls`.
 
 ### Provider (delivery)
 
 A **billed success** is one logical record: result **and** receipt. Network delivery cannot be physically atomic, so provider and broker use idempotent retry to recover the same stored record.
 
 ```
-expected[(channel_id, epoch)] = last_accepted + 1
-on request (channel_id, epoch, n, idempotency_key, voucher_sig, body):
+expected[(channel_id)] = last_accepted + 1
+on request (channel_id, version, n, idempotency_key, voucher_sig, body):
   load channel
   require channel.status == Open               # no new delivery while Closing
-  require epoch == channel.epoch
+  require version == channel.version
   require n == expected else reject jump
   require n <= channel.calls
-  verify_voucher(payer, channel_id, epoch, ch.version, n, voucher_sig)
+  verify_voucher(payer, channel_id, ch.version, n, voucher_sig)
     else reject                                # no receipt, not billed
 
   request_hash = H(canonical(body, idempotency_key))
-  if stored[(channel_id, epoch, n)] exists:
+  if stored[(channel_id, n)] exists:
     require stored.request_hash == request_hash
     return stored.result + stored.receipt       # exact re-issue
 
@@ -94,11 +96,11 @@ on request (channel_id, epoch, n, idempotency_key, voucher_sig, body):
 
   result_hash = H(canonical(result))
   receipt_sig = sign(receipt_digest(
-    channel_id, epoch, ch.version, n, request_hash, result_hash
+    channel_id, ch.version, n, request_hash, result_hash
   ))
 
   atomically persist {
-    (channel_id, epoch, n) → {
+    (channel_id, n) → {
       idempotency_key, request_hash, result, result_hash, receipt_sig
     },
     last_accepted: n,
@@ -108,7 +110,7 @@ on request (channel_id, epoch, n, idempotency_key, voucher_sig, body):
   return {
     result,
     receipt: {
-      channel_id, epoch, version: ch.version, n,
+      channel_id, version: ch.version, n,
       request_hash, result_hash, signature: receipt_sig
     }
   }
@@ -116,9 +118,9 @@ on request (channel_id, epoch, n, idempotency_key, voucher_sig, body):
 
 **Spend broker:** treat a result without a verifiable receipt as incomplete; retry the same request. Return the result to the agent only after receipt verification and durable acknowledgement.
 
-**Re-issue:** retry/lookup returns the same result and receipt for `(channel_id, epoch, n)`. Never execute the upstream call twice or change either hash.
+**Re-issue:** retry/lookup returns the same result and receipt for `(channel_id, n)`. Never execute the upstream call twice or change either hash. `n` is unique for the life of the channel.
 
-On-chain the provider still submits the **highest** voucher (`sig(5)` cashes calls 1..5). Receipts never go on-chain.
+On-chain the provider still submits the **highest** voucher (`sig(5)` cashes calls 1..5). Receipts never go on-chain. Re-submitting an already-settled highest voucher is a zero-payout no-op.
 
 ---
 
@@ -129,9 +131,9 @@ On-chain the provider still submits the **highest** voucher (`sig(5)` cashes cal
 - **Result+receipt record**: billed success includes both, bound by request/result hashes. Missing/invalid receipt ⇒ broker withholds result and retries the same `n`.
 - `lookahead` is **1**. Do not expose signatures or dump `sig(1)…sig(5)` to the agent.
 - Window caps count successful broker executions, not a single `sig(100)`.
-- When channel status is `Closing`, stop new delivery. Old-epoch claims remain valid until transition finalization.
-- After service update, freeze until a challenged rollover snapshots new terms and increments epoch.
-- Quota exhausted: request a rollover or open another channel with the next payer nonce.
+- When channel status is `Closing`, stop new delivery. Old-version claims remain valid until transition finalization.
+- After service update, freeze until a challenged `AdoptTerms` snapshots new terms. `counter` continues; new vouchers use the new version from `counter + 1`.
+- Same-term extra quota: `fund_channel` (no freeze). Quota exhausted at new terms: `AdoptTerms` or open another channel with the next payer nonce.
 
 ---
 
@@ -145,22 +147,24 @@ v0 therefore assumes an honest provider or trusted metering gateway for delivery
 
 ## Provider watcher
 
-Monitor `ChannelTransitionRequested`. Submit the highest old-epoch voucher before `close_after`:
+Monitor `ChannelTransitionRequested`. Submit the highest old-version voucher before `close_after`:
 
 ```
 on timer, each N vouchers, or transition event:
   submit claim_channel_funds(payer, channel_id, highest.counter, highest.signature)
 ```
 
-Claims may also run periodically while Open. The challenge deadline is the final deterministic settlement window; keep a safety margin.
+Claims may also run periodically while Open. The challenge deadline is the final deterministic settlement window; keep a safety margin. Same-term `fund_channel` does not require a challenge claim.
 
 ---
 
 ## Payer watcher
 
 ```
+if user wants more quota and ch.version == live svc.version:
+  fund_channel(payer, channel_id, additional_calls)
 if user wants to stop, ch.expiration reached, or ch.version != live svc.version:
-  request_channel_transition(payer, channel_id, Close or Rollover)
+  request_channel_transition(payer, channel_id, Close or AdoptTerms)
 after close_after:
   finalize_channel_transition(payer, channel_id)
 ```

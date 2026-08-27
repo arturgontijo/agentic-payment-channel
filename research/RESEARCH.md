@@ -25,7 +25,7 @@ A unidirectional prepaid channel with a monotonically increasing counter covers 
 |---|---|---|
 | **Organization owner** | Provider business | Registers an organization, manages members, holds the org deposit. |
 | **Service owner** | Org member | Publishes a priced service, receives claimed funds. |
-| **Channel owner (payer)** | Human-controlled spend account | Opens nonce-isolated channels, signs vouchers through a broker/vault, and requests challenged close/rollover. |
+| **Channel owner (payer)** | Human-controlled spend account | Opens nonce-isolated channels, funds them, signs vouchers through a broker/vault, and requests challenged close/AdoptTerms. |
 | **Claimer** | Typically the service owner | Submits the latest signed voucher and withdraws earned funds. Anyone with a valid voucher can trigger a claim; payout always goes to the service owner. |
 
 ---
@@ -71,13 +71,13 @@ A priced, versioned offering.
 | `version` | Starts at `1`; increments on every update |
 | `asset` | Immutable payment asset for the service |
 | `price` | Unit price **per call** |
-| `minimum_calls` | Floor on prepaid quota when opening / updating a channel |
+| `minimum_calls` | Floor on prepaid quota when opening / adopting new terms |
 | `expiration_threshold` | Channel lifetime, in chain time units (blocks / slots) |
 | `trials` | Reserved for a free-trial quota (not enforced in the current logic) |
 | `channels` | Count of open channels against this service |
 | `metadata` | Arbitrary blob (schema, model id, rate-limit hints) |
 
-Updating a service **always bumps `version`**. Open epochs keep their snapshot; new terms apply only after a challenged rollover (see [Service versioning](#service-versioning)).
+Updating a service **always bumps `version`**. Open channels keep their snapshot; new terms apply only after a challenged AdoptTerms (see [Service versioning](#service-versioning)). Same-term extra quota is `fund_channel`.
 
 ### Channel
 
@@ -89,18 +89,17 @@ A prepaid escrow from one payer to one service. A protocol-assigned monotonic pa
 | `owner` | Payer |
 | `nonce` | `NextChannelNonce[payer]`; protocol increments it on every open |
 | `organization` / `service` | Target |
-| `epoch` | Starts at 1; increments only after finalized rollover |
-| `version` / `asset` / `receipt_signer` | Service terms snapshotted per epoch |
-| `price` | Unit price snapshotted per epoch |
-| `calls` | Prepaid quota (number of calls funded) |
-| `counter` | Highest settled call count (starts at `0`) |
-| `expiration` | `open_time + service.expiration_threshold` |
-| `status` | `Open` or `Closing { close_after, Close | Rollover }` |
+| `version` / `asset` / `receipt_signer` | Service terms snapshotted at open / AdoptTerms |
+| `price` | Unit price snapshotted at open / AdoptTerms |
+| `calls` | Prepaid ceiling (grows on `fund_channel` / AdoptTerms) |
+| `counter` | Highest settled call count (starts at `0`; never resets) |
+| `expiration` | Refreshed on fund / AdoptTerms |
+| `status` | `Open` or `Closing { close_after, Close | AdoptTerms }` |
 
-Locked amount at open:
+Locked amount at open (and again at each fund, for the added calls only):
 
 ```
-funds = channel.price × channel.calls
+funds = channel.price × channel.calls          // total prepaid at current snapshot
 ```
 
 Unsettled remainder at any time:
@@ -110,11 +109,11 @@ require 0 ≤ channel.counter ≤ channel.calls
 remaining = checked_mul(channel.price, channel.calls − channel.counter)
 ```
 
-All arithmetic is checked; overflow/underflow aborts atomically. Later service updates do not rewrite the active epoch. New terms apply only after a challenged rollover.
+All arithmetic is checked; overflow/underflow aborts atomically. Later service updates do not rewrite the active snapshot. New terms apply only after a challenged AdoptTerms. `counter` never resets, so an already-settled voucher pays zero if resubmitted.
 
 ### Escrow vault
 
-Each channel/asset has an isolated program-owned escrow. A pooled-balance implementation must enforce identical per-channel liabilities and aggregate conservation. Opens/rollovers transfer in; claims/finalized transitions transfer out.
+Each channel/asset has an isolated program-owned escrow. A pooled-balance implementation must enforce identical per-channel liabilities and aggregate conservation. Opens and `fund_channel` transfer in; claims and finalized transitions transfer out.
 
 ---
 
@@ -129,7 +128,7 @@ service_id = H( domain || "svc" || owner || len(name) || name )
 channel_id = H( domain || "ch" || payer || org_id || service_id || nonce )
 
 voucher    = H( domain || "voucher" || channel_id
-                || channel.epoch || channel.version || counter )
+                || channel.version || counter )
 ```
 
 `H` is a 256-bit cryptographic hash. Integers are fixed-width little-endian; variable bytes are length-prefixed. Each deployment supports one exact signature convention over the raw digest—no alternate wrappers.
@@ -145,20 +144,21 @@ create organization
 create service ───────────────────────────────► update service (version++)
         │                                              │
         ▼                                              │ broker freezes stale snapshot
-open channel(nonce): epoch 1                           │
+open channel(nonce)                                    │
 lock asset/price × calls                               │
         │                                              │
+        ├── fund_channel: same terms, calls += N       │
         ├── broker/provider off-chain calls + receipts │
-        ├── provider claims cumulative vouchers       │
+        ├── provider claims cumulative vouchers        │
         │                                              ▼
-        └── payer requests Close or Rollover ──► status=Closing
+        └── payer requests Close or AdoptTerms ─► status=Closing
                                                        │ challenge window:
-                                                       │ provider settles old epoch
+                                                       │ provider settles old version
                                                        ▼
                                               finalize transition
                                               ├── Close: refund remainder
-                                              └── Rollover: epoch++, counter=0,
-                                                  snapshot/re-lock new terms
+                                              └── AdoptTerms: keep counter,
+                                                  snapshot/re-lock new remaining quota
 ```
 
 ## Sequence
@@ -174,9 +174,9 @@ sequenceDiagram
 
     Payer->>Chain: Open channel
     Chain->>Chain: Validate service, nonce, and quota
-    Chain->>Chain: Create epoch 1 and isolated escrow
+    Chain->>Chain: Snapshot terms and lock escrow
     Chain-->>Payer: ChannelCreated
-    Payer->>Broker: Install capability and epoch voucher tranche
+    Payer->>Broker: Install capability and voucher tranche
 
     loop Each metered call
         Agent->>Broker: execute request
@@ -189,32 +189,38 @@ sequenceDiagram
         Broker-->>Agent: Verified result
     end
 
+    opt Same-term top-up
+        Payer->>Chain: fund_channel additional calls
+        Chain->>Chain: Lock more escrow, raise calls, keep counter
+        Payer->>Broker: Load extra rungs
+    end
+
     opt Batched settlement
         Provider->>Chain: claim highest voucher
-        Chain->>Chain: Verify snapshot and bounded counter
+        Chain->>Chain: Verify version and bounded counter
         Chain-->>Provider: Transfer price times delta
     end
 
-    Payer->>Chain: request Close or Rollover
-    opt Rollover
-        Chain->>Chain: Snapshot and pre-fund pending next epoch
+    Payer->>Chain: request Close or AdoptTerms
+    opt AdoptTerms
+        Chain->>Chain: Snapshot new terms and pre-fund new quota
     end
     Chain-->>Broker: ChannelTransitionRequested
     Broker->>Broker: Freeze new calls
 
     rect rgb(245, 245, 245)
         Note over Chain,Provider: Challenge window
-        Provider->>Chain: Claim latest old-epoch voucher
+        Provider->>Chain: Claim latest old-version voucher
         Chain-->>Provider: Settle before close_after
     end
 
     Payer->>Chain: finalize_channel_transition
     alt Close
         Chain-->>Payer: Refund remaining and delete channel
-    else Rollover
+    else AdoptTerms
         Chain-->>Payer: Refund old remainder
-        Chain->>Chain: Promote pending escrow, increment epoch, reset counter
-        Chain-->>Broker: ChannelRolledOver
+        Chain->>Chain: Promote pending escrow, keep counter, set new version
+        Chain-->>Broker: ChannelTermsAdopted
     end
 ```
 
@@ -231,7 +237,7 @@ Checks:
 Effects:
 
 - Transfer checked `service.price × N` of `service.asset` to channel escrow.
-- Snapshot `epoch=1`, version, asset, receipt signer, price, `calls=N`, `counter=0`, `status=Open`.
+- Snapshot version, asset, receipt signer, price, `calls=N`, `counter=0`, `status=Open`.
 - Set `expiration = now + service.expiration_threshold`.
 - Increment `service.channels`.
 
@@ -240,18 +246,18 @@ Effects:
 For each broker-authorized call, the payer provides a **replaceable IOU** over
 
 ```
-(domain, channel_id, channel.epoch, channel.version, counter)
+(domain, channel_id, channel.version, counter)
 ```
 
-`counter` is **cumulative**, not per-call. After 17 billed calls the voucher is `counter = 17`, not 17 separate signatures of `1`. The provider keeps only the highest-counter signature. Older vouchers are worthless.
+`counter` is **cumulative** and never resets. After 17 billed calls the voucher is `counter = 17`, not 17 separate signatures of `1`. After a later top-up, the next voucher is `18`, not `1` again. The provider keeps only the highest-counter signature. Older vouchers are worthless (a resubmit of an already-settled `n` is a zero claim).
 
 This is a classic unidirectional payment channel:
 
-- The payer cannot decrease the counter (on-chain claim requires `counter > channel.counter`).
+- The payer cannot decrease the counter (on-chain claim requires `n ≥ channel.counter`, and `n < channel.counter` rejects).
 - The provider cannot invent a higher counter without the payer's signature.
 - Settlement cost is one on-chain claim for any number of calls.
 
-The signed epoch/version are channel snapshots, not live service terms. A service update freezes new broker calls. Outstanding vouchers remain claimable during the transition challenge; rollover increments epoch and resets counter.
+The signed version is the channel snapshot, not live service terms. A service update freezes new broker calls. Outstanding vouchers remain claimable during the transition challenge; AdoptTerms snapshots new terms and continues `counter`.
 
 For agents, the spend broker—not the agent—holds vouchers. It accepts a provider response only when the receipt binds channel snapshots, counter, request hash, and result hash. See [AGENTIC.md](AGENTIC.md) and [pseudo/v0/07-offchain.md](../pseudo/v0/07-offchain.md).
 
@@ -263,13 +269,14 @@ Payout always goes to **`service.owner`**, not the transaction sender.
 
 Path A — **exhausted cleanup**:
 
-- If remaining is zero, clean up the channel without a signature (unless a rollover is pending).
+- If remaining is zero, clean up the channel without a signature (unless AdoptTerms is pending).
 
 Path B — **voucher settlement**:
 
-- `channel.counter < counter ≤ channel.calls`.
-- Signature verifies over `(domain, channel_id, channel.epoch, channel.version, counter)`.
-- `claim = checked_mul(channel.price, counter − channel.counter)`.
+- `0 < counter ≤ channel.calls`.
+- Signature verifies over `(domain, channel_id, channel.version, counter)`.
+- If `counter == channel.counter`, return with no transfer (idempotent zero claim).
+- If `counter > channel.counter`, `claim = checked_mul(channel.price, counter − channel.counter)`.
 - Transfer `claim` from escrow to `service.owner`.
 - Persist the new counter atomically.
 
@@ -277,19 +284,21 @@ Claims work while `Open` or `Closing`, including after expiry/version change, un
 
 Claims are **incremental**. The provider can cash out every few calls, or wait and submit the latest voucher once.
 
-### 4. Challenged close / rollover
+### 4. Same-term fund vs challenged close / AdoptTerms
 
-Immediate refunds are unsafe because an unclaimed voucher may exist. v0 uses:
+**`fund_channel(additional_calls)`** is the top-up path. Live `service.version` must still match the channel snapshot. It locks `price × additional_calls`, raises `calls`, keeps `counter`, and may extend expiration. No freeze, no challenge. The pre-signed ladder is append-only (`old_calls+1 … new_calls`).
 
-1. Payer calls `request_channel_transition(Close | Rollover { calls })`.
-   - Rollover snapshots current next-epoch terms and pre-funds a pending escrow in this owner-signed transaction.
+Immediate **refunds** and **re-prices** are unsafe because an unclaimed voucher may exist. Those use a challenge:
+
+1. Payer calls `request_channel_transition(Close | AdoptTerms { calls })`.
+   - `AdoptTerms` requires `service.version != channel.version`. It snapshots live terms and pre-funds a new remaining quota (`calls` extra calls after the current counter) in this owner-signed transaction.
 2. Channel becomes `Closing`; broker/provider stop new calls.
-3. Until `close_after = now + CLOSE_CHALLENGE_PERIOD`, provider may settle the latest old-epoch voucher.
+3. Until `close_after = now + CLOSE_CHALLENGE_PERIOD`, provider may settle the latest old-version voucher.
 4. Anyone may finalize after the deadline without debiting the payer:
    - **Close:** refund latest `remaining` and delete channel; monotonic nonce prevents reopening that id.
-   - **Rollover:** refund old remaining, promote pre-funded pending escrow, increment epoch, reset counter, return to `Open`.
+   - **AdoptTerms:** refund old remaining, promote pre-funded pending escrow, snapshot new terms, set `calls = counter + pending.calls`, **keep `counter`**, return to `Open`.
 
-Payer may cancel before finalization and recover pending funds. If pre-funding fails, the request rolls back and channel stays `Open`. The channel id stays stable, while epoch prevents old-voucher replay.
+Payer may cancel before finalization and recover pending funds. If pre-funding fails, the request rolls back and channel stays `Open`. The channel id stays stable. Old-version vouchers no longer verify after AdoptTerms; new rungs continue from `counter + 1`.
 
 ### 5. Delete organization / service
 
@@ -312,19 +321,19 @@ Consequences:
 
 | Actor | After a version bump |
 |---|---|
-| Provider | Outstanding old-epoch vouchers settle at channel snapshots during the challenge. Cannot apply new price/asset/key to old IOUs. |
-| Payer | Requests Close or Rollover; no immediate refund. |
-| Payer who wants to continue | Finalized rollover increments epoch, snapshots current terms, and resets counter. |
+| Provider | Outstanding old-version vouchers settle at channel snapshots during the challenge. Cannot apply new price/asset/key to old IOUs. |
+| Payer | Requests Close or AdoptTerms; no immediate refund. `fund_channel` is rejected until versions match. |
+| Payer who wants to continue | Finalized AdoptTerms snapshots current terms, sets `calls = counter + new_quota`, and keeps `counter`. |
 
-This keeps prepaid rates honest without burning signed work or racing an immediate refund.
+This keeps prepaid rates honest without burning signed work or racing an immediate refund. Version, not a reset counter, is what stops an old IOU from paying again at new terms.
 
 ---
 
 ## Time and refunds
 
-Channels are not infinite. `expiration = open_or_rollover_time + service.expiration_threshold`.
+Channels are not infinite. `expiration` is set at open and refreshed on `fund_channel` / AdoptTerms using `service.expiration_threshold`.
 
-Expiry or a snapshot mismatch freezes new off-chain calls and is a reason to request a transition. It does not immediately move funds.
+Expiry or a snapshot mismatch freezes new off-chain calls and is a reason to request a transition. It does not immediately move funds. Same-term `fund_channel` may extend expiration without a challenge.
 
 After a transition request, the challenge deadline is the provider's deterministic final settlement window. Finalization computes refund from the latest on-chain counter. Providers still claim periodically and react to transition events with a safety margin.
 
@@ -340,9 +349,9 @@ These were used in the reference implementation and are knobs, not protocol inva
 | Service deposit | Anti-spam for service creation; returned on delete. |
 | Max name / metadata length | Bound storage. |
 | Max organization members | Enforced at org create (owner counts as 1). |
-| `minimum_calls` | Prevents dust channels that cost more to settle than they hold. |
+| `minimum_calls` | Prevents dust channels that cost more to settle than they hold (open / AdoptTerms). |
 | `expiration_threshold` | Provider claim window vs. payer capital lockup. |
-| `CLOSE_CHALLENGE_PERIOD` | Non-zero final settlement window before refund/rollover. |
+| `CLOSE_CHALLENGE_PERIOD` | Non-zero final settlement window before refund / AdoptTerms. |
 
 `trials` is stored on the service but is not billed in v0 (intended as a free-call allowance before the counter starts billing).
 
@@ -353,10 +362,10 @@ These were used in the reference implementation and are knobs, not protocol inva
 The chain does **not** record individual calls, request payloads, or API keys. Off-chain components that a Solana (or any other) implementation still needs:
 
 1. **Spend broker** — agent sends intended request; broker chooses/attaches voucher and never exposes it.
-2. **Provider receipts** — receipt binds deployment, channel epoch/version, counter, request hash, and result hash. Broker verifies and persists before returning result.
-3. **Idempotency** — provider stores result+receipt+highest voucher by `(channel, epoch, counter)`; broker retries the same outstanding counter after network loss.
-4. **Provider accounting** — accept only `counter+1` for the current Open epoch.
-5. **Watchers** — provider reacts to transition requests before `close_after`; payer/broker requests/finalizes transitions.
+2. **Provider receipts** — receipt binds deployment, channel version, counter, request hash, and result hash. Broker verifies and persists before returning result.
+3. **Idempotency** — provider stores result+receipt+highest voucher by `(channel, counter)`; broker retries the same outstanding counter after network loss.
+4. **Provider accounting** — accept only `counter+1` for the current Open version.
+5. **Watchers** — provider reacts to transition requests before `close_after`; payer/broker funds, requests, and finalizes transitions.
 6. **Discovery** — metadata advertises endpoints; the owner-controlled on-chain `receipt_signer` supplies authority.
 
 Receipts attest request/result bytes, not semantic correctness. v0 assumes an honest provider or trusted gateway; stronger delivery assurance is an optional bond/dispute, TEE, or verifiable-computation layer.
@@ -368,17 +377,17 @@ Receipts attest request/result bytes, not semantic correctness. v0 assumes an ho
 A port to Solana (or any other chain) should preserve these, regardless of account layout:
 
 1. **Nonce-isolated identity.** Id is `(deployment, payer, org, service, nonce)`; used ids cannot reopen.
-2. **Escrow conservation.** Active escrow equals checked `price × (calls − counter)`; pending rollover escrow separately equals its snapshotted `funds`.
-3. **Bounded monotonic counter.** `0 ≤ counter ≤ calls`; only a valid payer voucher increases it.
+2. **Escrow conservation.** Active escrow equals checked `price × (calls − counter)`; pending AdoptTerms escrow separately equals its snapshotted `funds`.
+3. **Bounded monotonic counter.** `0 ≤ counter ≤ calls`; only a valid payer voucher increases it; it never resets.
 4. **Snapshotted price.** Claims use `channel.price`, never the live `service.price`.
-5. **Epoch/version-bound vouchers.** Signed epoch/version equal channel snapshots.
-6. **Challenged transitions.** No refund/rollover before non-zero challenge deadline; claims stay valid while Closing.
+5. **Version-bound vouchers.** Signed version equals the channel snapshot.
+6. **Challenged transitions.** No refund / AdoptTerms before non-zero challenge deadline; claims stay valid while Closing. Same-term `fund_channel` has no challenge.
 7. **Claim payout to `service.owner`**, independent of who submits the tx.
 8. **Service update always increments version** (no silent field edits).
 9. **No delete while children exist.** `delete_service` iff `channels == 0`; `delete_organization` iff `services == 0`.
 10. **Explicit asset.** Service asset is immutable; channel/escrow snapshot it.
 11. **Atomic checked state.** Overflow, underflow, transfer failure, wrong asset, or invalid signature changes nothing.
-12. **Rollover isolation.** Only finalized rollover resets counter and it increments epoch.
+12. **Monotonic quota.** `fund_channel` raises `calls` at the current snapshot. Finalized AdoptTerms sets `calls = counter + new_quota` and keeps `counter`.
 
 ---
 
@@ -400,7 +409,7 @@ The voucher schema stays portable, while the deployment domain prevents replay a
 
 ```
 sign(H(domain || "voucher" || channel_id
-       || channel.epoch || channel.version || counter))
+       || channel.version || counter))
 ```
 
 `domain = encode("apc", v0, chain_id, program_id)`. Publish golden vectors for every implementation language.
@@ -410,11 +419,12 @@ sign(H(domain || "voucher" || channel_id
 ## Security notes for implementers
 
 - **Do not settle at live price.** Always use the snapshotted `channel.price`.
-- **Bind vouchers to deployment + channel epoch/version.**
+- **Bind vouchers to deployment + channel version.**
 - **Reject `counter > calls`.** Do not cap and continue.
+- **Never reset `counter`.** Same-term top-up raises `calls`; terms change continues from the latest settled `n`.
 - **Use checked arithmetic and atomic state/transfers.** Never saturate.
 - **Never reuse a channel nonce/id.** Protocol-assigned `NextChannelNonce[payer]` only increases.
-- **Use challenged close/rollover.** Immediate refunds can steal from an unclaimed voucher.
+- **Use challenged close / AdoptTerms.** Immediate refunds or in-place re-prices can steal from an unclaimed voucher.
 - **Refuse delete while children exist.** Otherwise claim/refund cannot load `service.owner` and funds freeze.
 - **Keep asset explicit and immutable** for each service.
 - **Anyone-can-submit claims** is intentional (relayer-friendly) only if payout is hardcoded to `service.owner`.
@@ -433,10 +443,11 @@ A complete port needs roughly these instructions:
 | `create_service` | org member | Publish priced service, lock deposit |
 | `update_service` | service owner | Edit terms, bump version (does not rewrite channels) |
 | `delete_service` | service owner | Remove service, return deposit (requires `channels == 0`) |
-| `open_channel` | payer | Lock asset/price × calls under next payer nonce, epoch 1 |
-| `request_channel_transition` | payer | Start challenged Close or Rollover |
+| `open_channel` | payer | Lock asset/price × calls under next payer nonce |
+| `fund_channel` | payer | Same-term top-up: raise `calls`, keep `counter` |
+| `request_channel_transition` | payer | Start challenged Close or AdoptTerms |
 | `cancel_channel_transition` | payer | Reopen before finalization |
-| `finalize_channel_transition` | anyone | Close/refund or epoch++ rollover after deadline |
+| `finalize_channel_transition` | anyone | Close/refund or adopt new terms after deadline |
 | `claim_channel_funds` | anyone | Settle snapshot-bound voucher / exhausted cleanup |
 
 That is the whole on-chain surface. Everything else is off-chain protocol around the voucher.
@@ -448,6 +459,5 @@ That is the whole on-chain surface. Everything else is off-chain protocol around
 Not in v0. Do not invent these during the first port:
 
 - Add/remove members after org create; transfer org or service ownership (rank is unused beyond owner vs member).
-- `fund_channel`: add calls at the current snapshot without resetting `counter`.
 - Bill `trials` as a free-call allowance before `counter` starts.
 - Optional provider bonds/disputes, TEEs, or verifiable computation for stronger delivery assurance.
